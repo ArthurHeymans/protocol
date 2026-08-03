@@ -219,6 +219,13 @@ pub fn encode(message: &ProtocolMessage) -> Result<Vec<u8>, String> {
 }
 
 pub fn decode(buf: &[u8]) -> Result<ProtocolMessage, String> {
+    if buf.len() > MAX_MESSAGE_SIZE {
+        return Err(format!(
+            "Message size {} exceeds maximum {}",
+            buf.len(),
+            MAX_MESSAGE_SIZE
+        ));
+    }
     let mut r = BytesReader::new(buf);
 
     // CRDT
@@ -452,6 +459,12 @@ mod tests {
             batch_id: BatchId([0; 8]),
         };
         let err = encode(&msg).unwrap_err();
+        assert!(err.contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn decode_rejects_payload_over_max_size() {
+        let err = decode(&vec![0; MAX_MESSAGE_SIZE + 1]).unwrap_err();
         assert!(err.contains("exceeds maximum"));
     }
 }

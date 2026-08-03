@@ -34,10 +34,12 @@ use std::{
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::mpsc,
+    time::Instant,
 };
-use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::accept_hdr_async_with_config;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{self, Message};
 
 use loro::awareness::EphemeralStore;
@@ -48,9 +50,12 @@ use protocol::{
 };
 use tracing::{debug, error, info, warn};
 
-// Limits to protect server memory from abusive fragment headers
-const MAX_FRAGMENTS: u64 = 4096; // hard cap on number of fragments per batch
-const MAX_BATCH_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB per batch
+// Defaults protecting server memory from abusive fragment streams.
+const DEFAULT_MAX_FRAGMENTS_PER_BATCH: u64 = 64;
+const DEFAULT_MAX_FRAGMENT_BATCH_BYTES: u64 = 8 * 1024 * 1024;
+const DEFAULT_MAX_INFLIGHT_FRAGMENT_BATCHES_PER_CONNECTION: usize = 8;
+const DEFAULT_MAX_INFLIGHT_FRAGMENT_BYTES_PER_CONNECTION: u64 = 16 * 1024 * 1024;
+const DEFAULT_FRAGMENT_REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RoomKey {
@@ -160,6 +165,12 @@ pub struct ServerConfig<DocCtx = ()> {
     /// Optional hook invoked after a connection fully closes.
     /// Receives the workspace id, connection id, and rooms the client had joined.
     pub on_close_connection: Option<CloseConnectionFn>,
+    pub max_fragments_per_batch: u64,
+    pub max_fragment_batch_bytes: u64,
+    pub max_inflight_fragment_batches_per_connection: usize,
+    /// Maximum sum of declared sizes for this connection's in-flight batches.
+    pub max_inflight_fragment_bytes_per_connection: u64,
+    pub fragment_reassembly_timeout: Duration,
 }
 
 // CRDT document abstraction to reduce match-based branching
@@ -480,6 +491,13 @@ impl<DocCtx> Default for ServerConfig<DocCtx> {
             authenticate: None,
             handshake_auth: None,
             on_close_connection: None,
+            max_fragments_per_batch: DEFAULT_MAX_FRAGMENTS_PER_BATCH,
+            max_fragment_batch_bytes: DEFAULT_MAX_FRAGMENT_BATCH_BYTES,
+            max_inflight_fragment_batches_per_connection:
+                DEFAULT_MAX_INFLIGHT_FRAGMENT_BATCHES_PER_CONNECTION,
+            max_inflight_fragment_bytes_per_connection:
+                DEFAULT_MAX_INFLIGHT_FRAGMENT_BYTES_PER_CONNECTION,
+            fragment_reassembly_timeout: DEFAULT_FRAGMENT_REASSEMBLY_TIMEOUT,
         }
     }
 }
@@ -717,14 +735,22 @@ struct FragmentBatch {
     fragment_count: u64,
     total_size: u64,
     received: u64,
+    received_size: u64,
+    expires_at: Instant,
+    timeout_tx: Sender,
     chunks: Vec<Option<Vec<u8>>>,
 }
 
 struct CompletedFragmentBatch {
     payload: Vec<u8>,
-    fragments: Vec<Vec<u8>>,
+    fragment_sizes: Vec<usize>,
     fragment_count: u64,
     total_size: u64,
+}
+
+enum FragmentBatchError {
+    PayloadTooLarge,
+    SizeMismatch,
 }
 
 impl<DocCtx> Hub<DocCtx>
@@ -738,17 +764,50 @@ where
         batch_id: protocol::BatchId,
         fragment_count: u64,
         total_size: u64,
-    ) {
+        timeout_tx: &Sender,
+    ) -> Result<(), FragmentBatchError> {
         let key = (room.clone(), batch_id);
-        let chunks_len = usize::try_from(fragment_count).unwrap_or(0);
+        let chunks_len = usize::try_from(fragment_count)
+            .map_err(|_| FragmentBatchError::PayloadTooLarge)?;
         let batch = FragmentBatch {
             from_conn,
             fragment_count,
             total_size,
             received: 0,
+            received_size: 0,
+            expires_at: Instant::now() + self.config.fragment_reassembly_timeout,
+            timeout_tx: timeout_tx.clone(),
             chunks: vec![None; chunks_len],
         };
         self.fragments.insert(key, batch);
+        Ok(())
+    }
+
+    fn expire_fragment_batches(&mut self, now: Instant) {
+        let expired: Vec<_> = self
+            .fragments
+            .iter()
+            .filter(|(_, batch)| batch.expires_at <= now)
+            .map(|((room, batch_id), batch)| {
+                (
+                    room.clone(),
+                    *batch_id,
+                    batch.from_conn,
+                    batch.timeout_tx.clone(),
+                )
+            })
+            .collect();
+        for (room, batch_id, from_conn, timeout_tx) in expired {
+            self.fragments.remove(&(room.clone(), batch_id));
+            debug!(room=?room.room, from_conn, "fragment batch timed out");
+            send_ack(
+                &timeout_tx,
+                room.crdt,
+                &room.room,
+                batch_id,
+                UpdateStatusCode::FragmentTimeout,
+            );
+        }
     }
 
     /// Returns the completed batch and removes it from the reassembly map.
@@ -758,33 +817,67 @@ where
         batch_id: protocol::BatchId,
         index: u64,
         fragment: Vec<u8>,
-    ) -> Option<CompletedFragmentBatch> {
+    ) -> Result<Option<CompletedFragmentBatch>, FragmentBatchError> {
         let key = (room.clone(), batch_id);
-        let batch = self.fragments.get_mut(&key)?;
-        let idx = usize::try_from(index).ok()?;
-        if idx >= batch.chunks.len() {
-            return None;
+        let mut too_large = false;
+        let complete;
+        {
+            let batch = self
+                .fragments
+                .get_mut(&key)
+                .ok_or(FragmentBatchError::SizeMismatch)?;
+            let idx = usize::try_from(index).map_err(|_| FragmentBatchError::SizeMismatch)?;
+            if idx >= batch.chunks.len() {
+                return Err(FragmentBatchError::SizeMismatch);
+            }
+            if batch.chunks[idx].is_some() {
+                return Ok(None);
+            }
+            let fragment_size =
+                u64::try_from(fragment.len()).map_err(|_| FragmentBatchError::PayloadTooLarge)?;
+            let received_size = batch.received_size.checked_add(fragment_size);
+            if let Some(received_size) = received_size.filter(|size| *size <= batch.total_size) {
+                batch.received_size = received_size;
+                batch.chunks[idx] = Some(fragment);
+                batch.received += 1;
+                complete = batch.received == batch.fragment_count;
+            } else {
+                too_large = true;
+                complete = false;
+            }
         }
-        if batch.chunks[idx].is_none() {
-            batch.chunks[idx] = Some(fragment);
-            batch.received += 1;
+        if too_large {
+            self.fragments.remove(&key);
+            return Err(FragmentBatchError::PayloadTooLarge);
         }
-        if batch.received != batch.fragment_count {
-            return None;
+        if !complete {
+            return Ok(None);
         }
 
-        let batch = self.fragments.remove(&key)?;
-        let fragments = batch.chunks.into_iter().collect::<Option<Vec<_>>>()?;
-        let mut payload = Vec::with_capacity(batch.total_size as usize);
-        for fragment in &fragments {
-            payload.extend_from_slice(fragment);
+        let batch = self
+            .fragments
+            .remove(&key)
+            .ok_or(FragmentBatchError::SizeMismatch)?;
+        if batch.received_size != batch.total_size {
+            return Err(FragmentBatchError::SizeMismatch);
         }
-        Some(CompletedFragmentBatch {
+        let fragments = batch
+            .chunks
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(FragmentBatchError::SizeMismatch)?;
+        let mut payload = Vec::with_capacity(batch.total_size as usize);
+        let mut fragment_sizes = Vec::with_capacity(fragments.len());
+        for fragment in fragments {
+            fragment_sizes.push(fragment.len());
+            payload.extend(fragment);
+        }
+        Ok(Some(CompletedFragmentBatch {
             payload,
-            fragments,
+            fragment_sizes,
             fragment_count: batch.fragment_count,
             total_size: batch.total_size,
-        })
+        }))
     }
 }
 
@@ -838,6 +931,25 @@ where
             self.config.clone(),
             workspace.to_string(),
         )));
+        // One periodic sweep per workspace bounds timeout work independently of batch churn.
+        let timeout_hub = hub.clone();
+        let sweep_period = self
+            .config
+            .fragment_reassembly_timeout
+            .min(Duration::from_secs(1))
+            .max(Duration::from_millis(1));
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(sweep_period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                timeout_hub
+                    .lock()
+                    .await
+                    .expire_fragment_batches(Instant::now());
+            }
+        });
+
         // Spawn saver task for this hub if configured
         if let (Some(ms), Some(saver)) = (
             self.config.save_interval_ms,
@@ -948,7 +1060,10 @@ where
     let workspace_holder_c = workspace_holder.clone();
 
         
-    let ws = accept_hdr_async(
+    let websocket_config = WebSocketConfig::default()
+        .max_message_size(Some(protocol::MAX_MESSAGE_SIZE))
+        .max_frame_size(Some(protocol::MAX_MESSAGE_SIZE));
+    let ws = accept_hdr_async_with_config(
         stream,
         move |req: &tungstenite::handshake::server::Request,
               resp: tungstenite::handshake::server::Response| {
@@ -1010,6 +1125,7 @@ where
             }
             Ok(resp)
         },
+        Some(websocket_config),
     )
     .await?;
 
@@ -1036,14 +1152,28 @@ where
 
     let mut joined_rooms: HashSet<RoomKey> = HashSet::new();
 
-    while let Some(msg) = stream.next().await {
-        match msg? {
+    let receive_result = loop {
+        let Some(msg) = stream.next().await else {
+            break Ok(());
+        };
+        let msg = match msg {
+            Ok(msg) => msg,
+            Err(error) => {
+                warn!(%error, "WebSocket receive error; closing connection");
+                break Err(error);
+            }
+        };
+        match msg {
             Message::Text(txt) => {
                 if txt == "ping" {
                     let _ = tx.send(Message::Text("pong".into()));
                 }
             }
             Message::Binary(data) => {
+                if data.len() > protocol::MAX_MESSAGE_SIZE {
+                    warn!(bytes=data.len(), "oversized protocol frame rejected");
+                    continue;
+                }
                 if let Some(proto) = try_decode(data.as_ref()) {
                     match proto {
                         ProtocolMessage::JoinRequest {
@@ -1220,10 +1350,11 @@ where
                                 );
                                 continue;
                             }
-                            // Bounds checks
+                            // Initialize batch (guard against hijack by another sender).
+                            let mut h = hub.lock().await;
                             if fragment_count == 0
-                                || fragment_count > MAX_FRAGMENTS
-                                || total_size_bytes > MAX_BATCH_BYTES
+                                || fragment_count > h.config.max_fragments_per_batch
+                                || total_size_bytes > h.config.max_fragment_batch_bytes
                             {
                                 send_ack(
                                     &tx,
@@ -1234,8 +1365,6 @@ where
                                 );
                                 continue;
                             }
-                            // Initialize batch (guard against hijack by another sender)
-                            let mut h = hub.lock().await;
                             let key = (room.clone(), batch_id);
                             if let Some(existing) = h.fragments.get(&key) {
                                 if existing.from_conn != conn_id {
@@ -1249,14 +1378,51 @@ where
                                     continue;
                                 }
                                 // Duplicate header from the same sender is idempotent.
-                            } else {
-                                h.start_fragment_batch(
-                                    &room,
-                                    conn_id,
+                                continue;
+                            }
+                            let (inflight, inflight_bytes) = h
+                                .fragments
+                                .values()
+                                .filter(|batch| batch.from_conn == conn_id)
+                                .fold((0usize, 0u64), |(count, bytes), batch| {
+                                    (count + 1, bytes.saturating_add(batch.total_size))
+                                });
+                            let exceeds_byte_budget = inflight_bytes
+                                .checked_add(total_size_bytes)
+                                .is_none_or(|bytes| {
+                                    bytes > h.config.max_inflight_fragment_bytes_per_connection
+                                });
+                            if inflight >= h.config.max_inflight_fragment_batches_per_connection
+                                || exceeds_byte_budget
+                            {
+                                send_ack(
+                                    &tx,
+                                    crdt,
+                                    &room.room,
                                     batch_id,
-                                    fragment_count,
-                                    total_size_bytes,
+                                    UpdateStatusCode::RateLimited,
                                 );
+                                continue;
+                            }
+                            match h.start_fragment_batch(
+                                &room,
+                                conn_id,
+                                batch_id,
+                                fragment_count,
+                                total_size_bytes,
+                                &tx,
+                            ) {
+                                Ok(()) => {}
+                                Err(_) => {
+                                    send_ack(
+                                        &tx,
+                                        crdt,
+                                        &room.room,
+                                        batch_id,
+                                        UpdateStatusCode::PayloadTooLarge,
+                                    );
+                                    continue;
+                                }
                             }
                         }
                         ProtocolMessage::DocUpdateFragment {
@@ -1320,8 +1486,24 @@ where
                                 continue;
                             }
                             // Accumulate and validate the complete update before any peer sees it.
-                            if let Some(completed) =
-                                h.add_fragment_and_maybe_finish(&room, batch_id, index, fragment)
+                            let completed = match h
+                                .add_fragment_and_maybe_finish(&room, batch_id, index, fragment)
+                            {
+                                Ok(Some(completed)) => completed,
+                                Ok(None) => continue,
+                                Err(error) => {
+                                    let status = match error {
+                                        FragmentBatchError::PayloadTooLarge => {
+                                            UpdateStatusCode::PayloadTooLarge
+                                        }
+                                        FragmentBatchError::SizeMismatch => {
+                                            UpdateStatusCode::InvalidUpdate
+                                        }
+                                    };
+                                    send_ack(&tx, crdt, &room.room, batch_id, status);
+                                    continue;
+                                }
+                            };
                             {
                                 let apply_result = match crdt {
                                     CrdtType::Loro
@@ -1356,16 +1538,19 @@ where
                                     if let Ok(bytes) = loro_protocol::encode(&header) {
                                         h.broadcast(&room, conn_id, Message::Binary(bytes.into()));
                                     }
-                                    for (index, fragment) in
-                                        completed.fragments.into_iter().enumerate()
+                                    let mut offset = 0;
+                                    for (index, fragment_size) in
+                                        completed.fragment_sizes.into_iter().enumerate()
                                     {
+                                        let end = offset + fragment_size;
                                         let message = ProtocolMessage::DocUpdateFragment {
                                             crdt,
                                             room_id: room.room.clone(),
                                             batch_id,
                                             index: index as u64,
-                                            fragment,
+                                            fragment: completed.payload[offset..end].to_vec(),
                                         };
+                                        offset = end;
                                         if let Ok(bytes) = loro_protocol::encode(&message) {
                                             h.broadcast(
                                                 &room,
@@ -1492,12 +1677,12 @@ where
                         code: CloseCode::Protocol,
                         reason: "Protocol error".into(),
                     })));
-                    break;
+                    break Ok(());
                 }
             }
             Message::Close(frame) => {
                 let _ = tx.send(Message::Close(frame.clone()));
-                break;
+                break Ok(());
             }
             Message::Ping(p) => {
                 let _ = tx.send(Message::Pong(p));
@@ -1505,7 +1690,7 @@ where
             }
             _ => {}
         }
-    }
+    };
 
     let rooms_for_hook: Vec<(CrdtType, String)> = joined_rooms
         .into_iter()
@@ -1533,5 +1718,5 @@ where
     }
 
     debug!(conn_id, "connection closed and cleaned up");
-    Ok(())
+    receive_result.map_err(Into::into)
 }
