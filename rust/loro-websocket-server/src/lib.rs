@@ -720,6 +720,13 @@ struct FragmentBatch {
     chunks: Vec<Option<Vec<u8>>>,
 }
 
+struct CompletedFragmentBatch {
+    payload: Vec<u8>,
+    fragments: Vec<Vec<u8>>,
+    fragment_count: u64,
+    total_size: u64,
+}
+
 impl<DocCtx> Hub<DocCtx>
 where
     DocCtx: Clone + Send + Sync + 'static,
@@ -744,39 +751,40 @@ where
         self.fragments.insert(key, batch);
     }
 
-    /// Returns Some(reassembled) when complete; removes batch.
+    /// Returns the completed batch and removes it from the reassembly map.
     fn add_fragment_and_maybe_finish(
         &mut self,
         room: &RoomKey,
         batch_id: protocol::BatchId,
         index: u64,
         fragment: Vec<u8>,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<CompletedFragmentBatch> {
         let key = (room.clone(), batch_id);
-        if let Some(b) = self.fragments.get_mut(&key) {
-            let idx = match usize::try_from(index) {
-                Ok(i) => i,
-                Err(_) => return None,
-            };
-            if idx >= b.chunks.len() {
-                return None;
-            }
-            if b.chunks[idx].is_none() {
-                b.chunks[idx] = Some(fragment);
-                b.received += 1;
-            }
-            if b.received == b.fragment_count {
-                let mut out = Vec::with_capacity(b.total_size as usize);
-                for ch in b.chunks.iter() {
-                    if let Some(bytes) = ch.as_ref() {
-                        out.extend_from_slice(bytes);
-                    }
-                }
-                self.fragments.remove(&key);
-                return Some(out);
-            }
+        let batch = self.fragments.get_mut(&key)?;
+        let idx = usize::try_from(index).ok()?;
+        if idx >= batch.chunks.len() {
+            return None;
         }
-        None
+        if batch.chunks[idx].is_none() {
+            batch.chunks[idx] = Some(fragment);
+            batch.received += 1;
+        }
+        if batch.received != batch.fragment_count {
+            return None;
+        }
+
+        let batch = self.fragments.remove(&key)?;
+        let fragments = batch.chunks.into_iter().collect::<Option<Vec<_>>>()?;
+        let mut payload = Vec::with_capacity(batch.total_size as usize);
+        for fragment in &fragments {
+            payload.extend_from_slice(fragment);
+        }
+        Some(CompletedFragmentBatch {
+            payload,
+            fragments,
+            fragment_count: batch.fragment_count,
+            total_size: batch.total_size,
+        })
     }
 }
 
@@ -1240,7 +1248,7 @@ where
                                     );
                                     continue;
                                 }
-                                // else: duplicate header from same sender -> accept and broadcast as-is
+                                // Duplicate header from the same sender is idempotent.
                             } else {
                                 h.start_fragment_batch(
                                     &room,
@@ -1250,8 +1258,6 @@ where
                                     total_size_bytes,
                                 );
                             }
-                            // Broadcast header as-is
-                            h.broadcast(&room, conn_id, Message::Binary(data));
                         }
                         ProtocolMessage::DocUpdateFragment {
                             crdt,
@@ -1313,36 +1319,76 @@ where
                                 );
                                 continue;
                             }
-                            // Broadcast this fragment as-is to others (only after validation)
-                            h.broadcast(&room, conn_id, Message::Binary(data.clone()));
-                            // Accumulate and possibly finish
-                            if let Some(buf) =
+                            // Accumulate and validate the complete update before any peer sees it.
+                            if let Some(completed) =
                                 h.add_fragment_and_maybe_finish(&room, batch_id, index, fragment)
                             {
-                                // On completion: parse and apply to stored doc state if applicable
                                 let apply_result = match crdt {
                                     CrdtType::Loro
                                     | CrdtType::LoroEphemeralStore
                                     | CrdtType::LoroEphemeralStorePersisted => {
                                         let start = std::time::Instant::now();
-                                        let res = h.apply_updates(&room, &[buf.clone()]);
+                                        let res = h.apply_updates(
+                                            &room,
+                                            std::slice::from_ref(&completed.payload),
+                                        );
                                         let elapsed_ms = start.elapsed().as_millis();
                                         if res.is_ok() {
                                             debug!(room=?room.room, updates=1, ms=%elapsed_ms, "applied reassembled updates");
                                         }
                                         res
                                     }
-                                    CrdtType::Elo => {
-                                        // Apply as indexing-only
-                                        h.apply_updates(&room, &[buf.clone()])
-                                    }
+                                    CrdtType::Elo => h.apply_updates(
+                                        &room,
+                                        std::slice::from_ref(&completed.payload),
+                                    ),
                                     _ => Ok(()),
                                 };
 
                                 if apply_result.is_ok() {
-                                    send_ack(&tx, crdt, &room.room, batch_id, UpdateStatusCode::Ok);
+                                    let header = ProtocolMessage::DocUpdateFragmentHeader {
+                                        crdt,
+                                        room_id: room.room.clone(),
+                                        batch_id,
+                                        fragment_count: completed.fragment_count,
+                                        total_size_bytes: completed.total_size,
+                                    };
+                                    if let Ok(bytes) = loro_protocol::encode(&header) {
+                                        h.broadcast(&room, conn_id, Message::Binary(bytes.into()));
+                                    }
+                                    for (index, fragment) in
+                                        completed.fragments.into_iter().enumerate()
+                                    {
+                                        let message = ProtocolMessage::DocUpdateFragment {
+                                            crdt,
+                                            room_id: room.room.clone(),
+                                            batch_id,
+                                            index: index as u64,
+                                            fragment,
+                                        };
+                                        if let Ok(bytes) = loro_protocol::encode(&message) {
+                                            h.broadcast(
+                                                &room,
+                                                conn_id,
+                                                Message::Binary(bytes.into()),
+                                            );
+                                        }
+                                    }
+                                    send_ack(
+                                        &tx,
+                                        crdt,
+                                        &room.room,
+                                        batch_id,
+                                        UpdateStatusCode::Ok,
+                                    );
                                 } else {
-                                    send_ack(&tx, crdt, &room.room, batch_id, UpdateStatusCode::InvalidUpdate);
+                                    send_ack(
+                                        &tx,
+                                        crdt,
+                                        &room.room,
+                                        batch_id,
+                                        UpdateStatusCode::InvalidUpdate,
+                                    );
                                 }
                             }
                         }

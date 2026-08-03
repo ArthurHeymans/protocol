@@ -85,6 +85,78 @@ async fn malformed_loro_update_is_rejected_without_broadcast() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn malformed_fragmented_loro_update_is_not_broadcast() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        let config: server::ServerConfig<()> = server::ServerConfig {
+            handshake_auth: Some(Arc::new(|args| args.token == Some("secret"))),
+            ..Default::default()
+        };
+        server::serve_incoming_with_config(listener, config)
+            .await
+            .unwrap();
+    });
+
+    let url = format!("ws://{addr}/workspace?token=secret");
+    let mut sender = Client::connect(&url).await.unwrap();
+    let mut receiver = Client::connect(&url).await.unwrap();
+    join(&mut sender, "room").await;
+    join(&mut receiver, "room").await;
+
+    let batch_id = BatchId([8; 8]);
+    sender
+        .send(&ProtocolMessage::DocUpdateFragmentHeader {
+            crdt: CrdtType::Loro,
+            room_id: "room".into(),
+            batch_id,
+            fragment_count: 2,
+            total_size_bytes: 3,
+        })
+        .await
+        .unwrap();
+    sender
+        .send(&ProtocolMessage::DocUpdateFragment {
+            crdt: CrdtType::Loro,
+            room_id: "room".into(),
+            batch_id,
+            index: 0,
+            fragment: vec![1],
+        })
+        .await
+        .unwrap();
+    sender
+        .send(&ProtocolMessage::DocUpdateFragment {
+            crdt: CrdtType::Loro,
+            room_id: "room".into(),
+            batch_id,
+            index: 1,
+            fragment: vec![2, 3],
+        })
+        .await
+        .unwrap();
+
+    loop {
+        let message = timeout(Duration::from_secs(1), sender.next())
+            .await
+            .expect("fragment acknowledgement timed out")
+            .unwrap()
+            .expect("sender connection closed");
+        if let ProtocolMessage::Ack { ref_id, status, .. } = message {
+            assert_eq!(ref_id, batch_id);
+            assert_eq!(status, UpdateStatusCode::InvalidUpdate);
+            break;
+        }
+    }
+
+    if let Ok(result) = timeout(Duration::from_millis(100), receiver.next()).await {
+        panic!("malformed fragments were broadcast: {result:?}");
+    }
+
+    server_task.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn malformed_loaded_loro_snapshot_rejects_join() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
