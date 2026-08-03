@@ -57,6 +57,8 @@ const DEFAULT_MAX_INFLIGHT_FRAGMENT_BATCHES_PER_CONNECTION: usize = 8;
 const DEFAULT_MAX_INFLIGHT_FRAGMENT_BYTES_PER_CONNECTION: u64 = 16 * 1024 * 1024;
 const DEFAULT_FRAGMENT_REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_OUTBOUND_FRAGMENT_SIZE: usize = 240 * 1024;
+const DEFAULT_MAX_WORKSPACES: usize = 1024;
+const DEFAULT_MAX_ROOMS_PER_WORKSPACE: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RoomKey {
@@ -182,6 +184,11 @@ pub struct ServerConfig<DocCtx = ()> {
     pub max_inflight_fragment_bytes_per_connection: u64,
     pub fragment_reassembly_timeout: Duration,
     pub outbound_fragment_size: usize,
+    /// Maximum workspace hubs retained by the registry. Hubs are not evicted.
+    pub max_workspaces: Option<usize>,
+    /// Maximum allocated room keys per workspace, counting loaded documents and
+    /// relay-only subscriptions. Persistent documents are not evicted.
+    pub max_rooms_per_workspace: Option<usize>,
 }
 
 // CRDT document abstraction to reduce match-based branching
@@ -535,6 +542,8 @@ impl<DocCtx> Default for ServerConfig<DocCtx> {
                 DEFAULT_MAX_INFLIGHT_FRAGMENT_BYTES_PER_CONNECTION,
             fragment_reassembly_timeout: DEFAULT_FRAGMENT_REASSEMBLY_TIMEOUT,
             outbound_fragment_size: DEFAULT_OUTBOUND_FRAGMENT_SIZE,
+            max_workspaces: Some(DEFAULT_MAX_WORKSPACES),
+            max_rooms_per_workspace: Some(DEFAULT_MAX_ROOMS_PER_WORKSPACE),
         }
     }
 }
@@ -580,6 +589,27 @@ where
         if !entry.iter().any(|(id, _)| *id == conn_id) {
             entry.push((conn_id, tx.clone()));
         }
+    }
+
+    fn has_room(&self, room: &RoomKey) -> bool {
+        self.docs.contains_key(room) || self.subs.contains_key(room)
+    }
+
+    fn allocated_room_count(&self) -> usize {
+        self.docs.len()
+            + self
+                .subs
+                .keys()
+                .filter(|room| !self.docs.contains_key(*room))
+                .count()
+    }
+
+    fn room_limit_reached(&self, room: &RoomKey) -> bool {
+        !self.has_room(room)
+            && self
+                .config
+                .max_rooms_per_workspace
+                .is_some_and(|limit| self.allocated_room_count() >= limit)
     }
 
     fn leave_all(&mut self, conn_id: u64) {
@@ -752,13 +782,15 @@ where
             }
             Ok(())
         };
+        let validator = (room.crdt == CrdtType::Loro && validate.is_some())
+            .then_some(&validate_candidate as &dyn Fn(&[u8]) -> Result<(), String>);
         let state = self
             .docs
             .get_mut(room)
             .ok_or_else(|| "room not found".to_string())?;
         state
             .doc
-            .apply_updates_validated(updates, Some(&validate_candidate))
+            .apply_updates_validated(updates, validator)
             .map_err(|error| {
                 warn!(room=?room.room, %error, "apply_updates failed");
                 error
@@ -1024,10 +1056,17 @@ where
         }
     }
 
-    async fn get_or_create(&self, workspace: &str) -> Arc<tokio::sync::Mutex<Hub<DocCtx>>> {
+    async fn get_or_create(&self, workspace: &str) -> Option<Arc<tokio::sync::Mutex<Hub<DocCtx>>>> {
         let mut map = self.hubs.lock().await;
-        if let Some(h) = map.get(workspace) {
-            return h.clone();
+        if let Some(hub) = map.get(workspace) {
+            return Some(hub.clone());
+        }
+        if self
+            .config
+            .max_workspaces
+            .is_some_and(|limit| map.len() >= limit)
+        {
+            return None;
         }
         let hub = Arc::new(tokio::sync::Mutex::new(Hub::new(
             self.config.clone(),
@@ -1097,7 +1136,7 @@ where
             });
         }
         map.insert(workspace.to_string(), hub.clone());
-        hub
+        Some(hub)
     }
 }
 
@@ -1155,6 +1194,8 @@ where
 
     // Capture config outside of non-async closure
     let handshake_auth = registry.config.handshake_auth.clone();
+    let authenticate = registry.config.authenticate.clone();
+    let default_permission = registry.config.default_permission;
     let close_connection = registry.config.on_close_connection.clone();
     let workspace_holder: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -1163,7 +1204,7 @@ where
     let websocket_config = WebSocketConfig::default()
         .max_message_size(Some(protocol::MAX_MESSAGE_SIZE))
         .max_frame_size(Some(protocol::MAX_MESSAGE_SIZE));
-    let ws = accept_hdr_async_with_config(
+    let mut ws = accept_hdr_async_with_config(
         stream,
         move |req: &tungstenite::handshake::server::Request,
               resp: tungstenite::handshake::server::Response| {
@@ -1235,7 +1276,11 @@ where
         .ok()
         .and_then(|g| g.clone())
         .unwrap_or_default();
-    let hub = registry.get_or_create(&workspace_id).await;
+    let Some(hub) = registry.get_or_create(&workspace_id).await else {
+        warn!(workspace=%workspace_id, "workspace limit reached");
+        ws.close(None).await?;
+        return Ok(());
+    };
 
     // writer task channel
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
@@ -1286,7 +1331,78 @@ where
                                 crdt,
                                 room: room_id.clone(),
                             };
+                            let send_room_limit_error = || {
+                                let error = ProtocolMessage::JoinError {
+                                    crdt,
+                                    room_id: room.room.clone(),
+                                    code: JoinErrorCode::Unknown,
+                                    message: "workspace room limit reached".into(),
+                                    receiver_version: None,
+                                    app_code: None,
+                                };
+                                if let Ok(bytes) = loro_protocol::encode(&error) {
+                                    let _ = tx.send(Message::Binary(bytes.into()));
+                                }
+                            };
+                            // Reject impossible joins before invoking a potentially expensive
+                            // authentication backend. Capacity is checked again after auth to
+                            // handle concurrent room allocation without reserving state here.
+                            if hub.lock().await.room_limit_reached(&room) {
+                                send_room_limit_error();
+                                continue;
+                            }
+                            // Authenticate before loading the room so denied joins cannot
+                            // allocate persistent state or consume room capacity.
+                            let auth_result = match &authenticate {
+                                Some(auth_fn) => {
+                                    (auth_fn)(AuthArgs {
+                                        room: room.room.clone(),
+                                        crdt: room.crdt,
+                                        auth,
+                                        conn_id,
+                                    })
+                                    .await
+                                }
+                                None => Ok(Some(default_permission)),
+                            };
+                            let permission = match auth_result {
+                                Ok(Some(permission)) => permission,
+                                Ok(None) => {
+                                    let err = ProtocolMessage::JoinError {
+                                        crdt,
+                                        room_id: room.room.clone(),
+                                        code: JoinErrorCode::AuthFailed,
+                                        message: "Authentication failed".into(),
+                                        receiver_version: None,
+                                        app_code: None,
+                                    };
+                                    if let Ok(bytes) = loro_protocol::encode(&err) {
+                                        let _ = tx.send(Message::Binary(bytes.into()));
+                                    }
+                                    warn!(room=?room.room, "join denied by authenticate() returning None");
+                                    continue;
+                                }
+                                Err(message) => {
+                                    let err = ProtocolMessage::JoinError {
+                                        crdt,
+                                        room_id: room.room.clone(),
+                                        code: JoinErrorCode::Unknown,
+                                        message,
+                                        receiver_version: None,
+                                        app_code: None,
+                                    };
+                                    if let Ok(bytes) = loro_protocol::encode(&err) {
+                                        let _ = tx.send(Message::Binary(bytes.into()));
+                                    }
+                                    warn!(room=?room.room, "join denied due to authenticate() error");
+                                    continue;
+                                }
+                            };
                             let mut h = hub.lock().await;
+                            if h.room_limit_reached(&room) {
+                                send_room_limit_error();
+                                continue;
+                            }
                             // ensure doc exists / load
                             if let Err(message) = h.ensure_room_loaded(&room).await {
                                 let error = ProtocolMessage::JoinError {
@@ -1301,53 +1417,6 @@ where
                                     let _ = tx.send(Message::Binary(bytes.into()));
                                 }
                                 continue;
-                            }
-                            // authenticate
-                            let mut permission = h.config.default_permission;
-                            if let Some(auth_fn) = &h.config.authenticate {
-                                let room_str = room.room.clone();
-                                match (auth_fn)(AuthArgs {
-                                    room: room_str,
-                                    crdt: room.crdt,
-                                    auth: auth.clone(),
-                                    conn_id,
-                                })
-                                .await
-                                {
-                                    Ok(Some(p)) => {
-                                        permission = p;
-                                    }
-                                    Ok(None) => {
-                                        let err = ProtocolMessage::JoinError {
-                                            crdt,
-                                            room_id: room.room.clone(),
-                                            code: JoinErrorCode::AuthFailed,
-                                            message: "Authentication failed".into(),
-                                            receiver_version: None,
-                                            app_code: None,
-                                        };
-                                        if let Ok(bytes) = loro_protocol::encode(&err) {
-                                            let _ = tx.send(Message::Binary(bytes.into()));
-                                        }
-                                        warn!(room=?room.room, "join denied by authenticate() returning None");
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        let err = ProtocolMessage::JoinError {
-                                            crdt,
-                                            room_id: room.room.clone(),
-                                            code: JoinErrorCode::Unknown,
-                                            message: e,
-                                            receiver_version: None,
-                                            app_code: None,
-                                        };
-                                        if let Ok(bytes) = loro_protocol::encode(&err) {
-                                            let _ = tx.send(Message::Binary(bytes.into()));
-                                        }
-                                        warn!(room=?room.room, "join denied due to authenticate() error");
-                                        continue;
-                                    }
-                                }
                             }
                             // register subscriber and record permission
                             h.join(conn_id, room.clone(), &tx);
