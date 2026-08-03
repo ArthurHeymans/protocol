@@ -141,10 +141,17 @@ pub struct CloseConnectionArgs {
     pub rooms: Vec<(CrdtType, String)>,
 }
 
-type CloseConnectionFuture =
-    Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
-type CloseConnectionFn =
-    Arc<dyn Fn(CloseConnectionArgs) -> CloseConnectionFuture + Send + Sync>;
+type CloseConnectionFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
+type CloseConnectionFn = Arc<dyn Fn(CloseConnectionArgs) -> CloseConnectionFuture + Send + Sync>;
+
+pub struct ValidateLoroSnapshotArgs<'a> {
+    pub workspace: &'a str,
+    pub room: &'a str,
+    pub snapshot: &'a [u8],
+}
+
+type ValidateLoroSnapshotFn =
+    dyn for<'a> Fn(ValidateLoroSnapshotArgs<'a>) -> Result<(), String> + Send + Sync;
 
 #[derive(Clone)]
 pub struct ServerConfig<DocCtx = ()> {
@@ -166,6 +173,8 @@ pub struct ServerConfig<DocCtx = ()> {
     /// Optional hook invoked after a connection fully closes.
     /// Receives the workspace id, connection id, and rooms the client had joined.
     pub on_close_connection: Option<CloseConnectionFn>,
+    /// Validate candidate Loro state before mutating a room or broadcasting.
+    pub validate_loro_snapshot: Option<Arc<ValidateLoroSnapshotFn>>,
     pub max_fragments_per_batch: u64,
     pub max_fragment_batch_bytes: u64,
     pub max_inflight_fragment_batches_per_connection: usize,
@@ -185,6 +194,13 @@ trait CrdtDoc: Send {
     }
     fn apply_updates(&mut self, _updates: &[Vec<u8>]) -> Result<(), String> {
         Ok(())
+    }
+    fn apply_updates_validated(
+        &mut self,
+        updates: &[Vec<u8>],
+        _validate: Option<&dyn Fn(&[u8]) -> Result<(), String>>,
+    ) -> Result<(), String> {
+        self.apply_updates(updates)
     }
     fn should_persist(&self) -> bool {
         false
@@ -215,9 +231,26 @@ impl LoroRoomDoc {
 }
 impl CrdtDoc for LoroRoomDoc {
     fn apply_updates(&mut self, updates: &[Vec<u8>]) -> Result<(), String> {
+        self.apply_updates_validated(updates, None)
+    }
+    fn apply_updates_validated(
+        &mut self,
+        updates: &[Vec<u8>],
+        validate: Option<&dyn Fn(&[u8]) -> Result<(), String>>,
+    ) -> Result<(), String> {
+        let candidate = self.doc.fork();
         for update in updates {
-            self.doc.import(update).map_err(|error| error.to_string())?;
+            candidate
+                .import(update)
+                .map_err(|error| error.to_string())?;
         }
+        if let Some(validate) = validate {
+            let snapshot = candidate
+                .export(ExportMode::Snapshot)
+                .map_err(|error| error.to_string())?;
+            validate(&snapshot)?;
+        }
+        self.doc = candidate;
         Ok(())
     }
     fn should_persist(&self) -> bool {
@@ -493,6 +526,7 @@ impl<DocCtx> Default for ServerConfig<DocCtx> {
             authenticate: None,
             handshake_auth: None,
             on_close_connection: None,
+            validate_loro_snapshot: None,
             max_fragments_per_batch: DEFAULT_MAX_FRAGMENTS_PER_BATCH,
             max_fragment_batch_bytes: DEFAULT_MAX_FRAGMENT_BATCH_BYTES,
             max_inflight_fragment_batches_per_connection:
@@ -705,20 +739,34 @@ where
     }
 
     fn apply_updates(&mut self, room: &RoomKey, updates: &[Vec<u8>]) -> Result<(), String> {
-        match self.docs.get_mut(room) {
-            Some(state) => {
-                if let Err(e) = state.doc.apply_updates(updates) {
-                    warn!(room=?room.room, %e, "apply_updates failed");
-                    Err(e)
-                } else {
-                    if state.doc.should_persist() {
-                        state.dirty = true;
-                    }
-                    Ok(())
+        let validate = self.config.validate_loro_snapshot.clone();
+        let validate_candidate = |snapshot: &[u8]| {
+            if room.crdt == CrdtType::Loro {
+                if let Some(validate) = &validate {
+                    validate(ValidateLoroSnapshotArgs {
+                        workspace: &self.workspace,
+                        room: &room.room,
+                        snapshot,
+                    })?;
                 }
             }
-            None => Err("room not found".into()),
+            Ok(())
+        };
+        let state = self
+            .docs
+            .get_mut(room)
+            .ok_or_else(|| "room not found".to_string())?;
+        state
+            .doc
+            .apply_updates_validated(updates, Some(&validate_candidate))
+            .map_err(|error| {
+                warn!(room=?room.room, %error, "apply_updates failed");
+                error
+            })?;
+        if state.doc.should_persist() {
+            state.dirty = true;
         }
+        Ok(())
     }
 
     fn snapshot_bytes(&self, room: &RoomKey) -> Option<Vec<u8>> {
@@ -770,8 +818,8 @@ where
         timeout_tx: &Sender,
     ) -> Result<(), FragmentBatchError> {
         let key = (room.clone(), batch_id);
-        let chunks_len = usize::try_from(fragment_count)
-            .map_err(|_| FragmentBatchError::PayloadTooLarge)?;
+        let chunks_len =
+            usize::try_from(fragment_count).map_err(|_| FragmentBatchError::PayloadTooLarge)?;
         let batch = FragmentBatch {
             from_conn,
             fragment_count,
@@ -1102,7 +1150,6 @@ async fn handle_conn<DocCtx>(
 where
     DocCtx: Clone + Send + Sync + 'static,
 {
-
     // Generate a connection id
     let conn_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -1113,7 +1160,6 @@ where
         Arc::new(std::sync::Mutex::new(None));
     let workspace_holder_c = workspace_holder.clone();
 
-        
     let websocket_config = WebSocketConfig::default()
         .max_message_size(Some(protocol::MAX_MESSAGE_SIZE))
         .max_frame_size(Some(protocol::MAX_MESSAGE_SIZE));
@@ -1225,7 +1271,7 @@ where
             }
             Message::Binary(data) => {
                 if data.len() > protocol::MAX_MESSAGE_SIZE {
-                    warn!(bytes=data.len(), "oversized protocol frame rejected");
+                    warn!(bytes = data.len(), "oversized protocol frame rejected");
                     continue;
                 }
                 if let Some(proto) = try_decode(data.as_ref()) {
@@ -1617,13 +1663,7 @@ where
                                             );
                                         }
                                     }
-                                    send_ack(
-                                        &tx,
-                                        crdt,
-                                        &room.room,
-                                        batch_id,
-                                        UpdateStatusCode::Ok,
-                                    );
+                                    send_ack(&tx, crdt, &room.room, batch_id, UpdateStatusCode::Ok);
                                 } else {
                                     send_ack(
                                         &tx,
@@ -1706,13 +1746,7 @@ where
 
                                 if apply_result.is_ok() {
                                     h.broadcast(&room, conn_id, Message::Binary(data));
-                                    send_ack(
-                                        &tx,
-                                        crdt,
-                                        &room.room,
-                                        batch_id,
-                                        UpdateStatusCode::Ok,
-                                    );
+                                    send_ack(&tx, crdt, &room.room, batch_id, UpdateStatusCode::Ok);
                                 } else {
                                     send_ack(
                                         &tx,

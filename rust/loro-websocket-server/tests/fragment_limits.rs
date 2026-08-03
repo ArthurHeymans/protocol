@@ -1,9 +1,9 @@
+use futures_util::{SinkExt, StreamExt};
 use loro_websocket_client::Client;
 use loro_websocket_server as server;
 use loro_websocket_server::protocol::{
     BatchId, CrdtType, ProtocolMessage, UpdateStatusCode, MAX_MESSAGE_SIZE,
 };
-use futures_util::{SinkExt, StreamExt};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tokio::time::{timeout, Duration};

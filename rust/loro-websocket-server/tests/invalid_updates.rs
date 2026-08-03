@@ -85,6 +85,82 @@ async fn malformed_loro_update_is_rejected_without_broadcast() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn malformed_update_batch_does_not_partially_mutate_room() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        let config: server::ServerConfig<()> = server::ServerConfig {
+            handshake_auth: Some(Arc::new(|args| args.token == Some("secret"))),
+            ..Default::default()
+        };
+        server::serve_incoming_with_config(listener, config)
+            .await
+            .unwrap();
+    });
+
+    let url = format!("ws://{addr}/workspace?token=secret");
+    let mut sender = Client::connect(&url).await.unwrap();
+    join(&mut sender, "room").await;
+
+    let partial = loro::LoroDoc::new();
+    partial.get_text("text").insert(0, "partial").unwrap();
+    let batch_id = BatchId([6; 8]);
+    sender
+        .send(&ProtocolMessage::DocUpdate {
+            crdt: CrdtType::Loro,
+            room_id: "room".into(),
+            updates: vec![
+                partial.export(loro::ExportMode::Snapshot).unwrap(),
+                vec![1, 2, 3],
+            ],
+            batch_id,
+        })
+        .await
+        .unwrap();
+    loop {
+        let message = timeout(Duration::from_secs(1), sender.next())
+            .await
+            .expect("acknowledgement timed out")
+            .unwrap()
+            .expect("sender connection closed");
+        if let ProtocolMessage::Ack { ref_id, status, .. } = message {
+            if ref_id == batch_id {
+                assert_eq!(status, UpdateStatusCode::InvalidUpdate);
+                break;
+            }
+        }
+    }
+
+    let mut observer = Client::connect(&url).await.unwrap();
+    observer
+        .send(&ProtocolMessage::JoinRequest {
+            crdt: CrdtType::Loro,
+            room_id: "room".into(),
+            auth: Vec::new(),
+            version: Vec::new(),
+        })
+        .await
+        .unwrap();
+    loop {
+        let message = timeout(Duration::from_secs(1), observer.next())
+            .await
+            .expect("observer join timed out")
+            .unwrap()
+            .expect("observer connection closed");
+        if let ProtocolMessage::DocUpdate { updates, .. } = message {
+            let document = loro::LoroDoc::new();
+            for update in updates {
+                document.import(&update).unwrap();
+            }
+            assert_eq!(document.get_text("text").to_string(), "");
+            break;
+        }
+    }
+
+    server_task.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn malformed_fragmented_loro_update_is_not_broadcast() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
