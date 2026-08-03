@@ -179,7 +179,9 @@ trait CrdtDoc: Send {
     fn export_snapshot(&self) -> Option<Vec<u8>> {
         None
     }
-    fn import_snapshot(&mut self, _data: &[u8]) {}
+    fn import_snapshot(&mut self, _data: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
     fn allow_backfill_when_no_other_clients(&self) -> bool {
         false
     }
@@ -200,8 +202,8 @@ impl LoroRoomDoc {
 }
 impl CrdtDoc for LoroRoomDoc {
     fn apply_updates(&mut self, updates: &[Vec<u8>]) -> Result<(), String> {
-        for u in updates {
-            let _ = self.doc.import(u);
+        for update in updates {
+            self.doc.import(update).map_err(|error| error.to_string())?;
         }
         Ok(())
     }
@@ -211,8 +213,9 @@ impl CrdtDoc for LoroRoomDoc {
     fn export_snapshot(&self) -> Option<Vec<u8>> {
         self.doc.export(ExportMode::Snapshot).ok()
     }
-    fn import_snapshot(&mut self, data: &[u8]) {
-        let _ = self.doc.import(data);
+    fn import_snapshot(&mut self, data: &[u8]) -> Result<(), String> {
+        self.doc.import(data).map_err(|error| error.to_string())?;
+        Ok(())
     }
 }
 
@@ -236,9 +239,9 @@ impl CrdtDoc for EphemeralRoomDoc {
         }
     }
     fn apply_updates(&mut self, updates: &[Vec<u8>]) -> Result<(), String> {
-        for u in updates {
-            if !u.is_empty() {
-                self.store.apply(u);
+        for update in updates {
+            if !update.is_empty() {
+                self.store.apply(update);
             }
         }
         Ok(())
@@ -270,9 +273,9 @@ impl CrdtDoc for PersistentEphemeralRoomDoc {
         }
     }
     fn apply_updates(&mut self, updates: &[Vec<u8>]) -> Result<(), String> {
-        for u in updates {
-            if !u.is_empty() {
-                self.store.apply(u);
+        for update in updates {
+            if !update.is_empty() {
+                self.store.apply(update);
             }
         }
         Ok(())
@@ -283,11 +286,12 @@ impl CrdtDoc for PersistentEphemeralRoomDoc {
     fn export_snapshot(&self) -> Option<Vec<u8>> {
         Some(self.store.encode_all())
     }
-    fn import_snapshot(&mut self, data: &[u8]) {
+    fn import_snapshot(&mut self, data: &[u8]) -> Result<(), String> {
         self.store = EphemeralStore::new(self.timeout_ms);
         if !data.is_empty() {
             self.store.apply(data);
         }
+        Ok(())
     }
     fn allow_backfill_when_no_other_clients(&self) -> bool {
         true
@@ -577,9 +581,9 @@ where
         }
     }
 
-    async fn ensure_room_loaded(&mut self, room: &RoomKey) {
+    async fn ensure_room_loaded(&mut self, room: &RoomKey) -> Result<(), String> {
         if self.docs.contains_key(room) {
-            return;
+            return Ok(());
         }
         match room.crdt {
             CrdtType::Loro => {
@@ -594,12 +598,13 @@ where
                     match (loader)(args).await {
                         Ok(loaded) => {
                             if let Some(bytes) = loaded.snapshot {
-                                d.import_snapshot(&bytes);
+                                d.import_snapshot(&bytes)
+                                    .map_err(|error| format!("load document failed: {error}"))?;
                             }
                             ctx = loaded.ctx;
                         }
-                        Err(e) => {
-                            warn!(room=?room.room, %e, "load document failed");
+                        Err(error) => {
+                            return Err(format!("load document failed: {error}"));
                         }
                     }
                 }
@@ -635,12 +640,14 @@ where
                     match (loader)(args).await {
                         Ok(loaded) => {
                             if let Some(bytes) = loaded.snapshot {
-                                d.import_snapshot(&bytes);
+                                d.import_snapshot(&bytes).map_err(|error| {
+                                    format!("load persisted ephemeral store failed: {error}")
+                                })?;
                             }
                             ctx = loaded.ctx;
                         }
-                        Err(e) => {
-                            warn!(room=?room.room, %e, "load persisted ephemeral store failed");
+                        Err(error) => {
+                            return Err(format!("load persisted ephemeral store failed: {error}"));
                         }
                     }
                 }
@@ -666,6 +673,7 @@ where
             }
             _ => {}
         }
+        Ok(())
     }
 
     fn current_version_bytes(&self, room: &RoomKey) -> Vec<u8> {
@@ -1042,7 +1050,20 @@ where
                             };
                             let mut h = hub.lock().await;
                             // ensure doc exists / load
-                            h.ensure_room_loaded(&room).await;
+                            if let Err(message) = h.ensure_room_loaded(&room).await {
+                                let error = ProtocolMessage::JoinError {
+                                    crdt,
+                                    room_id: room.room.clone(),
+                                    code: JoinErrorCode::Unknown,
+                                    message,
+                                    receiver_version: None,
+                                    app_code: None,
+                                };
+                                if let Ok(bytes) = loro_protocol::encode(&error) {
+                                    let _ = tx.send(Message::Binary(bytes.into()));
+                                }
+                                continue;
+                            }
                             // authenticate
                             let mut permission = h.config.default_permission;
                             if let Some(auth_fn) = &h.config.authenticate {
