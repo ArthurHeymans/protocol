@@ -56,6 +56,7 @@ const DEFAULT_MAX_FRAGMENT_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_MAX_INFLIGHT_FRAGMENT_BATCHES_PER_CONNECTION: usize = 8;
 const DEFAULT_MAX_INFLIGHT_FRAGMENT_BYTES_PER_CONNECTION: u64 = 16 * 1024 * 1024;
 const DEFAULT_FRAGMENT_REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_OUTBOUND_FRAGMENT_SIZE: usize = 240 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RoomKey {
@@ -171,6 +172,7 @@ pub struct ServerConfig<DocCtx = ()> {
     /// Maximum sum of declared sizes for this connection's in-flight batches.
     pub max_inflight_fragment_bytes_per_connection: u64,
     pub fragment_reassembly_timeout: Duration,
+    pub outbound_fragment_size: usize,
 }
 
 // CRDT document abstraction to reduce match-based branching
@@ -498,6 +500,7 @@ impl<DocCtx> Default for ServerConfig<DocCtx> {
             max_inflight_fragment_bytes_per_connection:
                 DEFAULT_MAX_INFLIGHT_FRAGMENT_BYTES_PER_CONNECTION,
             fragment_reassembly_timeout: DEFAULT_FRAGMENT_REASSEMBLY_TIMEOUT,
+            outbound_fragment_size: DEFAULT_OUTBOUND_FRAGMENT_SIZE,
         }
     }
 }
@@ -888,6 +891,57 @@ fn next_batch_id() -> protocol::BatchId {
     protocol::BatchId(NEXT_BATCH_ID.fetch_add(1, Ordering::Relaxed).to_be_bytes())
 }
 
+fn send_update(
+    tx: &Sender,
+    crdt: CrdtType,
+    room: &str,
+    update: Vec<u8>,
+    configured_fragment_size: usize,
+) -> Result<(), String> {
+    let batch_id = next_batch_id();
+    let fragment_size = configured_fragment_size
+        .min(DEFAULT_OUTBOUND_FRAGMENT_SIZE)
+        .max(1);
+    if update.len() <= fragment_size {
+        let message = ProtocolMessage::DocUpdate {
+            crdt,
+            room_id: room.to_string(),
+            updates: vec![update],
+            batch_id,
+        };
+        let bytes = loro_protocol::encode(&message).map_err(|error| error.to_string())?;
+        return tx
+            .send(Message::Binary(bytes.into()))
+            .map_err(|_| "connection closed while sending update".to_string());
+    }
+
+    let fragment_count = update.len().div_ceil(fragment_size);
+    let header = ProtocolMessage::DocUpdateFragmentHeader {
+        crdt,
+        room_id: room.to_string(),
+        batch_id,
+        fragment_count: fragment_count as u64,
+        total_size_bytes: update.len() as u64,
+    };
+    let bytes = loro_protocol::encode(&header).map_err(|error| error.to_string())?;
+    tx.send(Message::Binary(bytes.into()))
+        .map_err(|_| "connection closed while sending fragment header".to_string())?;
+
+    for (index, fragment) in update.chunks(fragment_size).enumerate() {
+        let message = ProtocolMessage::DocUpdateFragment {
+            crdt,
+            room_id: room.to_string(),
+            batch_id,
+            index: index as u64,
+            fragment: fragment.to_vec(),
+        };
+        let bytes = loro_protocol::encode(&message).map_err(|error| error.to_string())?;
+        tx.send(Message::Binary(bytes.into()))
+            .map_err(|_| "connection closed while sending fragment".to_string())?;
+    }
+    Ok(())
+}
+
 fn send_ack(
     tx: &Sender,
     crdt: CrdtType,
@@ -1266,18 +1320,21 @@ where
                             if let Ok(bytes) = loro_protocol::encode(&ok) {
                                 let _ = tx.send(Message::Binary(bytes.into()));
                             }
-                            // send initial state:
-                            // - If snapshot available (Loro), send as a DocUpdate.
-                            if let Some(snap) = h.snapshot_bytes(&room) {
-                                let du = ProtocolMessage::DocUpdate {
+                            // Send the initial state, fragmenting it when needed.
+                            if let Some(snapshot) = h.snapshot_bytes(&room) {
+                                match send_update(
+                                    &tx,
                                     crdt,
-                                    room_id: room.room.clone(),
-                                    updates: vec![snap],
-                                    batch_id: next_batch_id(),
-                                };
-                                if let Ok(bytes) = loro_protocol::encode(&du) {
-                                    let _ = tx.send(Message::Binary(bytes.into()));
-                                    debug!(room=?room.room, "sent initial snapshot after join");
+                                    &room.room,
+                                    snapshot,
+                                    h.config.outbound_fragment_size,
+                                ) {
+                                    Ok(()) => {
+                                        debug!(room=?room.room, "sent initial snapshot after join")
+                                    }
+                                    Err(error) => {
+                                        warn!(room=?room.room, %error, "failed to send initial snapshot")
+                                    }
                                 }
                             } else {
                                 // Otherwise, attempt backfill if other clients present or the CRDT allows
@@ -1295,15 +1352,16 @@ where
                                         .map(|s| s.doc.compute_backfill(&version))
                                         .unwrap_or_default();
                                     let backfill_cnt = backfill.len();
-                                    for u in backfill {
-                                        let du = ProtocolMessage::DocUpdate {
+                                    for update in backfill {
+                                        if let Err(error) = send_update(
+                                            &tx,
                                             crdt,
-                                            room_id: room.room.clone(),
-                                            updates: vec![u],
-                                            batch_id: next_batch_id(),
-                                        };
-                                        if let Ok(bytes) = loro_protocol::encode(&du) {
-                                            let _ = tx.send(Message::Binary(bytes.into()));
+                                            &room.room,
+                                            update,
+                                            h.config.outbound_fragment_size,
+                                        ) {
+                                            warn!(room=?room.room, %error, "failed to send backfill");
+                                            break;
                                         }
                                     }
                                     if backfill_cnt > 0 {
