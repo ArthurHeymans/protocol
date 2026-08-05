@@ -202,3 +202,74 @@ async fn e2e_sync_two_clients_elo_adaptor_roundtrip() {
 
     server_task.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn elo_rejoining_client_backfills_updates_made_while_disconnected() {
+    const KEY: [u8; 32] = [0x5a; 32];
+
+    async fn wait_for_text(doc: &tokio::sync::Mutex<loro_crdt::LoroDoc>, expected: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if doc.lock().await.get_text("text").to_string() == expected {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("document did not reach {expected:?}"));
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        let cfg: Cfg = server::ServerConfig {
+            handshake_auth: Some(Arc::new(|args| args.token == Some("secret"))),
+            ..Default::default()
+        };
+        server::serve_incoming_with_config(listener, cfg)
+            .await
+            .unwrap();
+    });
+
+    let url = format!("ws://{addr}/ws-elo-backfill?token=secret");
+    let writer = LoroWebsocketClient::connect(&url).await.unwrap();
+    let reader = LoroWebsocketClient::connect(&url).await.unwrap();
+    let writer_doc = Arc::new(tokio::sync::Mutex::new(loro_crdt::LoroDoc::new()));
+    let reader_doc = Arc::new(tokio::sync::Mutex::new(loro_crdt::LoroDoc::new()));
+    let room_id = "room-elo-backfill";
+    let _writer_room = writer
+        .join_elo_with_adaptor(room_id, writer_doc.clone(), "k1", KEY)
+        .await
+        .unwrap();
+    let reader_room = reader
+        .join_elo_with_adaptor(room_id, reader_doc.clone(), "k1", KEY)
+        .await
+        .unwrap();
+
+    {
+        let doc = writer_doc.lock().await;
+        doc.get_text("text").insert(0, "online").unwrap();
+        doc.commit();
+    }
+    wait_for_text(&reader_doc, "online").await;
+
+    reader_room.leave().await.unwrap();
+    drop(reader_room);
+    drop(reader);
+    {
+        let doc = writer_doc.lock().await;
+        doc.get_text("text").insert(6, " + offline").unwrap();
+        doc.commit();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let reconnected_reader = LoroWebsocketClient::connect(&url).await.unwrap();
+    let _reader_room = reconnected_reader
+        .join_elo_with_adaptor(room_id, reader_doc.clone(), "k1", KEY)
+        .await
+        .unwrap();
+    wait_for_text(&reader_doc, "online + offline").await;
+
+    server_task.abort();
+}

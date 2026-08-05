@@ -63,7 +63,7 @@ This is a test-first, cross-language hardening effort. Each stage starts by addi
 - Include regression tests that import legacy authenticated raw-delta plaintext while all newly emitted records use the canonical list encoding.
 - Run `pnpm --filter loro-adaptors test`, its typecheck, and `cargo test -p loro-websocket-client`.
 
-**Status**: Not Started
+**Status**: In Progress (Rust fixed-key substage complete: canonical exact-range records, genuine snapshot metadata, canonical/legacy import, ordered post-join worker shutdown, fixed-key ID rejection, IV-reuse prevention, and reconnect backfill; resolver/rotation/retry/error-metadata and TypeScript work remain)
 
 ## Stage 3: Correct server indexing, identity, and snapshot retention
 

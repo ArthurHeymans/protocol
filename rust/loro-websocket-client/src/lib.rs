@@ -42,12 +42,11 @@
 
 use futures_util::{SinkExt, StreamExt};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     hash::{Hash, Hasher},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
-        Mutex as StdMutex,
+        Arc, Mutex as StdMutex,
     },
 };
 use tokio::{
@@ -303,10 +302,55 @@ mod tests {
         }
     }
 
+    fn counter_u64(counter: loro::Counter) -> u64 {
+        require_ok(
+            u64::try_from(counter),
+            "Loro counter should be non-negative",
+        )
+    }
+
     fn lock_unpoisoned<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
         mutex
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    async fn wait_for_recorded_len<T>(items: &StdMutex<Vec<T>>, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if lock_unpoisoned(items).len() >= expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {expected} recorded items"));
+    }
+
+    fn encode_test_delta_container(
+        peer: &[u8],
+        start: u64,
+        end: u64,
+        key_id: &str,
+        key: &[u8; 32],
+        iv: [u8; ELO_IV_LENGTH],
+        plaintext: &[u8],
+    ) -> Vec<u8> {
+        use protocol::bytes::BytesWriter;
+
+        let mut header = BytesWriter::new();
+        header.push_byte(protocol::elo::EloRecordKind::DeltaSpan as u8);
+        header.push_var_bytes(peer);
+        header.push_uleb128(start);
+        header.push_uleb128(end);
+        header.push_var_string(key_id);
+        header.push_var_bytes(&iv);
+        let record = require_ok(
+            encrypt_elo_record(key, &iv, header.finalize(), plaintext),
+            "test DeltaSpan should encrypt",
+        );
+        encode_elo_container(&[record])
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -356,6 +400,456 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn elo_local_update_is_canonical_delta_span_with_exact_metadata() {
+        let doc = Arc::new(Mutex::new(LoroDoc::new()));
+        let key = [7u8; 32];
+        let base_snapshot = {
+            let doc = doc.lock().await;
+            require_ok(doc.set_peer_id(42), "peer id should be configurable");
+            require_ok(
+                doc.get_text("text").insert(0, "base"),
+                "base edit should succeed",
+            );
+            doc.commit();
+            require_ok(
+                doc.export(loro::ExportMode::Snapshot),
+                "base snapshot should export",
+            )
+        };
+        let next_iv = Arc::new(AtomicU64::new(1));
+        let mut adaptor =
+            EloDocAdaptor::new(doc.clone(), "kid", key).with_iv_factory(Arc::new(move || {
+                let mut iv = [3; ELO_IV_LENGTH];
+                iv[..8].copy_from_slice(&next_iv.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+                iv
+            }));
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        adaptor
+            .set_ctx(CrdtAdaptorContext {
+                send_update: {
+                    let sent = sent.clone();
+                    Arc::new(move |update| lock_unpoisoned(&sent).push(update))
+                },
+                on_join_failed: Arc::new(|_| {}),
+                on_import_error: Arc::new(|error, _| panic!("unexpected packaging error: {error}")),
+            })
+            .await;
+        adaptor
+            .handle_join_ok(protocol::Permission::Write, Vec::new())
+            .await;
+        wait_for_recorded_len(&sent, 1).await;
+        lock_unpoisoned(&sent).clear();
+
+        let start = doc.lock().await.oplog_vv().get(&42).copied().unwrap_or(0);
+        {
+            let doc = doc.lock().await;
+            require_ok(
+                doc.get_text("text").insert(4, " + delta"),
+                "local edit should succeed",
+            );
+            doc.commit();
+        }
+        let end = doc.lock().await.oplog_vv().get(&42).copied().unwrap_or(0);
+
+        wait_for_recorded_len(&sent, 1).await;
+        let sent = lock_unpoisoned(&sent);
+        assert_eq!(sent.len(), 1);
+        let records = require_ok(
+            protocol::elo::decode_elo_container(&sent[0]),
+            "delta container should decode",
+        );
+        assert_eq!(records.len(), 1);
+        let parsed = require_ok(
+            protocol::elo::parse_elo_record_header(records[0]),
+            "delta header should parse",
+        );
+        let header = match parsed.header {
+            protocol::elo::EloHeader::Delta(header) => header,
+            _ => panic!("local update must use a DeltaSpan record"),
+        };
+        assert_eq!(header.peer_id, b"42");
+        assert!(header.start > 0);
+        assert_eq!(header.start, counter_u64(start));
+        assert_eq!(header.end, counter_u64(end));
+
+        let cipher = aes_gcm::Aes256Gcm::new((&key).into());
+        let plaintext = require_ok(
+            cipher.decrypt(
+                aes_gcm::Nonce::from_slice(&header.iv),
+                aes_gcm::aead::Payload {
+                    msg: parsed.ct,
+                    aad: parsed.aad,
+                },
+            ),
+            "delta ciphertext should decrypt",
+        );
+        let blobs = require_ok(
+            decode_canonical_delta_plaintext(&plaintext),
+            "new DeltaSpan plaintext should use the canonical list encoding",
+        );
+        assert_eq!(blobs.len(), 1);
+        let imported = LoroDoc::new();
+        require_ok(
+            imported.import(&base_snapshot),
+            "base snapshot should import",
+        );
+        require_ok(imported.import(blobs[0]), "delta plaintext should import");
+        assert_eq!(imported.get_text("text").to_string(), "base + delta");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn elo_rapid_local_updates_are_sent_in_callback_order_after_join() {
+        let doc = Arc::new(Mutex::new(LoroDoc::new()));
+        require_ok(
+            doc.lock().await.set_peer_id(77),
+            "peer id should be configurable",
+        );
+        let next_iv = Arc::new(AtomicU64::new(1));
+        let mut adaptor =
+            EloDocAdaptor::new(doc.clone(), "kid", [8; 32]).with_iv_factory(Arc::new(move || {
+                let mut iv = [0; ELO_IV_LENGTH];
+                iv[..8].copy_from_slice(&next_iv.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+                iv
+            }));
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        adaptor
+            .set_ctx(CrdtAdaptorContext {
+                send_update: {
+                    let sent = sent.clone();
+                    Arc::new(move |update| lock_unpoisoned(&sent).push(update))
+                },
+                on_join_failed: Arc::new(|_| {}),
+                on_import_error: Arc::new(|error, _| panic!("unexpected worker error: {error}")),
+            })
+            .await;
+
+        {
+            let doc = doc.lock().await;
+            require_ok(doc.get_text("text").insert(0, "one"), "first edit");
+            doc.commit();
+        }
+        let first_end = doc.lock().await.oplog_vv()[&77];
+        {
+            let doc = doc.lock().await;
+            require_ok(doc.get_text("text").insert(3, "two"), "second edit");
+            doc.commit();
+        }
+        let second_end = doc.lock().await.oplog_vv()[&77];
+        assert!(lock_unpoisoned(&sent).is_empty());
+
+        adaptor
+            .handle_join_ok(protocol::Permission::Write, Vec::new())
+            .await;
+        wait_for_recorded_len(&sent, 3).await;
+        let sent = lock_unpoisoned(&sent);
+        let mut spans = Vec::new();
+        let mut ivs = Vec::new();
+        for container in sent.iter().take(2) {
+            let records = require_ok(
+                protocol::elo::decode_elo_container(container),
+                "queued delta container should decode",
+            );
+            let parsed = require_ok(
+                protocol::elo::parse_elo_record_header(records[0]),
+                "queued delta header should parse",
+            );
+            match parsed.header {
+                protocol::elo::EloHeader::Delta(header) => {
+                    spans.push((header.start, header.end));
+                    ivs.push(header.iv);
+                }
+                _ => panic!("queued local updates must precede the join snapshot"),
+            }
+        }
+        assert_eq!(
+            spans,
+            vec![
+                (0, counter_u64(first_end)),
+                (counter_u64(first_end), counter_u64(second_end)),
+            ]
+        );
+        assert_ne!(ivs[0], ivs[1]);
+        let snapshot_records = require_ok(
+            protocol::elo::decode_elo_container(&sent[2]),
+            "join snapshot container should decode",
+        );
+        assert!(matches!(
+            require_ok(
+                protocol::elo::parse_elo_record_header(snapshot_records[0]),
+                "join snapshot header should parse",
+            )
+            .kind,
+            protocol::elo::EloRecordKind::Snapshot
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn elo_drop_cancels_queued_local_updates() {
+        let doc = Arc::new(Mutex::new(LoroDoc::new()));
+        let mut adaptor = EloDocAdaptor::new(doc.clone(), "kid", [8; 32]);
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        adaptor
+            .set_ctx(CrdtAdaptorContext {
+                send_update: {
+                    let sent = sent.clone();
+                    Arc::new(move |update| lock_unpoisoned(&sent).push(update))
+                },
+                on_join_failed: Arc::new(|_| {}),
+                on_import_error: Arc::new(|_, _| {}),
+            })
+            .await;
+        {
+            let doc = doc.lock().await;
+            require_ok(doc.get_text("text").insert(0, "queued"), "local edit");
+            doc.commit();
+        }
+        drop(adaptor);
+        tokio::task::yield_now().await;
+        assert!(lock_unpoisoned(&sent).is_empty());
+    }
+
+    #[test]
+    fn elo_multi_peer_blob_is_split_into_exact_delta_spans() {
+        let source = LoroDoc::new();
+        require_ok(
+            source.set_peer_id(11),
+            "first peer id should be configurable",
+        );
+        require_ok(
+            source.get_text("text").insert(0, "left"),
+            "first peer edit should succeed",
+        );
+        source.commit();
+        require_ok(
+            source.set_peer_id(22),
+            "second peer id should be configurable",
+        );
+        require_ok(
+            source.get_text("text").insert(4, "+right"),
+            "second peer edit should succeed",
+        );
+        source.commit();
+        let blob = require_ok(
+            source.export(loro::ExportMode::all_updates()),
+            "multi-peer update should export",
+        );
+        let key = [9u8; 32];
+        let next_iv = Arc::new(AtomicU64::new(1));
+        let iv_generator: EloIvGenerator = Arc::new(move || {
+            let mut iv = [4; ELO_IV_LENGTH];
+            iv[..8].copy_from_slice(&next_iv.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+            Ok(iv)
+        });
+        let used_ivs = Arc::new(StdMutex::new(HashSet::new()));
+        let container = require_ok(
+            encode_elo_delta_container_with(&source, "kid", &key, &iv_generator, &used_ivs, &blob),
+            "multi-peer update should package",
+        );
+
+        let records = require_ok(
+            protocol::elo::decode_elo_container(&container),
+            "delta container should decode",
+        );
+        assert_eq!(records.len(), 2);
+        let mut spans = Vec::new();
+        let destination = LoroDoc::new();
+        for record in records {
+            let parsed = require_ok(
+                protocol::elo::parse_elo_record_header(record),
+                "delta header should parse",
+            );
+            let header = match parsed.header {
+                protocol::elo::EloHeader::Delta(header) => header,
+                _ => panic!("multi-peer update must contain only DeltaSpan records"),
+            };
+            spans.push((header.peer_id.clone(), header.start, header.end));
+            let cipher = aes_gcm::Aes256Gcm::new((&key).into());
+            let plaintext = require_ok(
+                cipher.decrypt(
+                    aes_gcm::Nonce::from_slice(&header.iv),
+                    aes_gcm::aead::Payload {
+                        msg: parsed.ct,
+                        aad: parsed.aad,
+                    },
+                ),
+                "delta ciphertext should decrypt",
+            );
+            let blobs = require_ok(
+                decode_canonical_delta_plaintext(&plaintext),
+                "DeltaSpan plaintext should decode",
+            );
+            assert_eq!(blobs.len(), 1);
+            require_ok(destination.import(blobs[0]), "range update should import");
+        }
+        spans.sort();
+        let vv = source.oplog_vv();
+        assert_eq!(
+            spans,
+            vec![
+                (b"11".to_vec(), 0, counter_u64(vv[&11])),
+                (b"22".to_vec(), 0, counter_u64(vv[&22])),
+            ]
+        );
+        assert_eq!(destination.get_text("text").to_string(), "left+right");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn elo_join_snapshot_has_real_sorted_version_and_importable_plaintext() {
+        let doc = Arc::new(Mutex::new(LoroDoc::new()));
+        {
+            let doc = doc.lock().await;
+            require_ok(doc.set_peer_id(9), "first peer id should be configurable");
+            require_ok(
+                doc.get_text("text").insert(0, "a"),
+                "first edit should succeed",
+            );
+            doc.commit();
+            require_ok(doc.set_peer_id(10), "second peer id should be configurable");
+            require_ok(
+                doc.get_text("text").insert(1, "b"),
+                "second edit should succeed",
+            );
+            doc.commit();
+        }
+        let key = [5u8; 32];
+        let mut adaptor = EloDocAdaptor::new(doc.clone(), "kid", key)
+            .with_iv_factory(Arc::new(|| [6; ELO_IV_LENGTH]));
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        adaptor
+            .set_ctx(CrdtAdaptorContext {
+                send_update: {
+                    let sent = sent.clone();
+                    Arc::new(move |update| lock_unpoisoned(&sent).push(update))
+                },
+                on_join_failed: Arc::new(|_| {}),
+                on_import_error: Arc::new(|error, _| panic!("unexpected snapshot error: {error}")),
+            })
+            .await;
+        adaptor
+            .handle_join_ok(protocol::Permission::Write, Vec::new())
+            .await;
+        wait_for_recorded_len(&sent, 1).await;
+
+        let container = {
+            let sent = lock_unpoisoned(&sent);
+            assert_eq!(sent.len(), 1);
+            sent[0].clone()
+        };
+        let records = require_ok(
+            protocol::elo::decode_elo_container(&container),
+            "snapshot container should decode",
+        );
+        let parsed = require_ok(
+            protocol::elo::parse_elo_record_header(records[0]),
+            "snapshot header should parse",
+        );
+        let header = match parsed.header {
+            protocol::elo::EloHeader::Snapshot(header) => header,
+            _ => panic!("join bootstrap must use a genuine snapshot record"),
+        };
+        let vv = doc.lock().await.oplog_vv();
+        assert_eq!(
+            header.vv,
+            vec![
+                (b"10".to_vec(), counter_u64(vv[&10])),
+                (b"9".to_vec(), counter_u64(vv[&9])),
+            ]
+        );
+        let cipher = aes_gcm::Aes256Gcm::new((&key).into());
+        let snapshot = require_ok(
+            cipher.decrypt(
+                aes_gcm::Nonce::from_slice(&header.iv),
+                aes_gcm::aead::Payload {
+                    msg: parsed.ct,
+                    aad: parsed.aad,
+                },
+            ),
+            "snapshot ciphertext should decrypt",
+        );
+        let imported = LoroDoc::new();
+        require_ok(
+            imported.import(&snapshot),
+            "snapshot plaintext should import",
+        );
+        assert_eq!(imported.get_text("text").to_string(), "ab");
+        assert_eq!(imported.oplog_vv(), vv);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn elo_legacy_raw_delta_plaintext_remains_importable() {
+        let source = LoroDoc::new();
+        require_ok(source.set_peer_id(5), "peer id should be configurable");
+        require_ok(
+            source.get_text("text").insert(0, "legacy"),
+            "legacy edit should succeed",
+        );
+        source.commit();
+        let raw_delta = require_ok(
+            source.export(loro::ExportMode::all_updates()),
+            "legacy raw delta should export",
+        );
+        let end = counter_u64(source.oplog_vv()[&5]);
+        let key = [4; 32];
+        let container =
+            encode_test_delta_container(b"5", 0, end, "kid", &key, [1; ELO_IV_LENGTH], &raw_delta);
+
+        let destination = Arc::new(Mutex::new(LoroDoc::new()));
+        let mut adaptor = EloDocAdaptor::new(destination.clone(), "kid", key);
+        adaptor.apply_update(vec![container]).await;
+        assert_eq!(
+            destination.lock().await.get_text("text").to_string(),
+            "legacy"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn elo_fixed_key_adaptor_rejects_other_key_ids() {
+        let source = LoroDoc::new();
+        require_ok(source.set_peer_id(5), "peer id should be configurable");
+        require_ok(
+            source.get_text("text").insert(0, "secret"),
+            "source edit should succeed",
+        );
+        source.commit();
+        let raw_delta = require_ok(
+            source.export(loro::ExportMode::all_updates()),
+            "source delta should export",
+        );
+        let end = counter_u64(source.oplog_vv()[&5]);
+        let key = [4; 32];
+        let container = encode_test_delta_container(
+            b"5",
+            0,
+            end,
+            "other-kid",
+            &key,
+            [2; ELO_IV_LENGTH],
+            &raw_delta,
+        );
+
+        let destination = Arc::new(Mutex::new(LoroDoc::new()));
+        let mut adaptor = EloDocAdaptor::new(destination.clone(), "kid", key);
+        let errors = Arc::new(StdMutex::new(Vec::new()));
+        adaptor
+            .set_ctx(CrdtAdaptorContext {
+                send_update: Arc::new(|_| {}),
+                on_join_failed: Arc::new(|_| {}),
+                on_import_error: {
+                    let errors = errors.clone();
+                    Arc::new(move |error, _| lock_unpoisoned(&errors).push(error))
+                },
+            })
+            .await;
+        adaptor.apply_update(vec![container]).await;
+
+        assert_eq!(destination.lock().await.get_text("text").to_string(), "");
+        assert_eq!(
+            lock_unpoisoned(&errors).as_slice(),
+            &["unknown ELO key ID: other-kid"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn elo_default_iv_generation_is_random() {
         let doc = Arc::new(Mutex::new(LoroDoc::new()));
         let adaptor = EloDocAdaptor::new(doc, "kid", [7u8; 32]);
@@ -399,6 +893,22 @@ mod tests {
         assert_ne!(first_iv, second_iv);
     }
 
+    #[test]
+    fn elo_rejects_repeated_iv_from_compatibility_factory() {
+        let doc = Arc::new(Mutex::new(LoroDoc::new()));
+        let adaptor = EloDocAdaptor::new(doc, "kid", [7u8; 32])
+            .with_iv_factory(Arc::new(|| [9; ELO_IV_LENGTH]));
+
+        require_ok(
+            adaptor.encode_elo_snapshot_container(b"first"),
+            "first use of an IV should succeed",
+        );
+        let error = adaptor
+            .encode_elo_snapshot_container(b"second")
+            .expect_err("repeated IV must fail before encryption");
+        assert_eq!(error, EloCryptoError::Encryption);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn elo_randomness_failure_is_reported_without_sending() {
         let doc = Arc::new(Mutex::new(LoroDoc::new()));
@@ -440,6 +950,7 @@ mod tests {
         adaptor
             .handle_join_ok(protocol::Permission::Write, Vec::new())
             .await;
+        wait_for_recorded_len(&reported, 2).await;
 
         assert!(lock_unpoisoned(&sent).is_empty());
         let reported = lock_unpoisoned(&reported);
@@ -674,7 +1185,9 @@ impl ConnectionWorker {
                             config: self.config.clone(),
                         };
                         tokio::spawn(async move {
-                            if let Err(err) = client.join_with_adaptor(&room_name, adaptor_box).await {
+                            if let Err(err) =
+                                client.join_with_adaptor(&room_name, adaptor_box).await
+                            {
                                 eprintln!("rejoin after RoomError failed: {}", err);
                             }
                         });
@@ -683,7 +1196,10 @@ impl ConnectionWorker {
             }
             ProtocolMessage::Ack { ref_id, status, .. } => {
                 let sent_payloads = {
-                    let mut map = self.sent_batches.lock().unwrap();
+                    let mut map = self
+                        .sent_batches
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     map.remove(&(key.clone(), ref_id))
                 };
 
@@ -726,7 +1242,7 @@ impl ConnectionWorker {
             .retain(|(room, _), _| room != key);
         self.sent_batches
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|(room, _), _| room != key);
     }
 }
@@ -785,8 +1301,7 @@ pub struct LoroWebsocketClient {
     // For generating unique fragment batch ids
     next_batch_id: Arc<AtomicU64>,
     // Track outbound batches to surface update errors with original payloads
-    sent_batches:
-        Arc<StdMutex<HashMap<(RoomKey, protocol::BatchId), Vec<Vec<u8>>>>>,
+    sent_batches: Arc<StdMutex<HashMap<(RoomKey, protocol::BatchId), Vec<Vec<u8>>>>>,
     // Configurable knobs
     config: Arc<ClientConfig>,
 }
@@ -1027,7 +1542,7 @@ impl LoroWebsocketClient {
                 }
             } else {
                 let total = upd.len();
-                let n = (total + frag_limit - 1) / frag_limit;
+                let n = total.div_ceil(frag_limit);
                 // header
                 let header = ProtocolMessage::DocUpdateFragmentHeader {
                     crdt,
@@ -1361,18 +1876,17 @@ impl Drop for LoroDocAdaptor {
     }
 }
 
-// --- EloDocAdaptor: E2EE Loro (minimal snapshot-only packaging) ---
+// --- EloDocAdaptor: E2EE Loro ---
 const ELO_IV_LENGTH: usize = 12;
 
-type EloIvGenerator =
-    Arc<dyn Fn() -> Result<[u8; ELO_IV_LENGTH], getrandom::Error> + Send + Sync>;
+type EloIvGenerator = Arc<dyn Fn() -> Result<[u8; ELO_IV_LENGTH], getrandom::Error> + Send + Sync>;
 
 /// A local failure that prevents an encrypted ELO record from being emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EloCryptoError {
     /// The operating system could not provide a fresh IV.
     Randomness(getrandom::Error),
-    /// AES-GCM could not encrypt the plaintext.
+    /// Record encryption could not safely proceed.
     Encryption,
 }
 
@@ -1382,7 +1896,7 @@ impl std::fmt::Display for EloCryptoError {
             EloCryptoError::Randomness(error) => {
                 write!(f, "secure random IV generation failed: {error}")
             }
-            EloCryptoError::Encryption => write!(f, "AES-GCM encryption failed"),
+            EloCryptoError::Encryption => write!(f, "ELO record encryption failed"),
         }
     }
 }
@@ -1402,52 +1916,303 @@ fn secure_random_iv() -> Result<[u8; ELO_IV_LENGTH], getrandom::Error> {
     Ok(iv)
 }
 
-fn encode_elo_snapshot_container_with(
-    key_id: &str,
-    key: &[u8; 32],
+type EloUsedIvs = Arc<StdMutex<HashSet<[u8; ELO_IV_LENGTH]>>>;
+type EloWorkerActivity = Arc<StdMutex<bool>>;
+
+fn emit_elo_worker_result(
+    active: &EloWorkerActivity,
+    send: &Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+    on_error: &Arc<dyn Fn(String, Vec<Vec<u8>>) + Send + Sync>,
+    result: Result<Vec<u8>, String>,
+    source: Vec<Vec<u8>>,
+) {
+    let active = active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !*active {
+        return;
+    }
+    match result {
+        Ok(container) => (send)(container),
+        Err(error) => (on_error)(error, source),
+    }
+}
+
+fn next_unique_iv(
     iv_generator: &EloIvGenerator,
+    used_ivs: &EloUsedIvs,
+) -> Result<[u8; ELO_IV_LENGTH], EloCryptoError> {
+    let iv = iv_generator().map_err(EloCryptoError::Randomness)?;
+    if !used_ivs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(iv)
+    {
+        return Err(EloCryptoError::Encryption);
+    }
+    Ok(iv)
+}
+
+fn encrypt_elo_record(
+    key: &[u8; 32],
+    iv: &[u8; ELO_IV_LENGTH],
+    header_bytes: Vec<u8>,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, EloCryptoError> {
     use protocol::bytes::BytesWriter;
 
-    let iv = iv_generator().map_err(EloCryptoError::Randomness)?;
-    let mut hdr = BytesWriter::new();
-    hdr.push_byte(protocol::elo::EloRecordKind::Snapshot as u8);
-    hdr.push_uleb128(0); // vv count = 0
-    hdr.push_var_string(key_id);
-    hdr.push_var_bytes(&iv);
-    let header_bytes = hdr.finalize();
-
     let cipher = aes_gcm::Aes256Gcm::new(key.into());
     let ct = cipher
         .encrypt(
-            aes_gcm::Nonce::from_slice(&iv),
+            aes_gcm::Nonce::from_slice(iv),
             aes_gcm::aead::Payload {
                 msg: plaintext,
                 aad: &header_bytes,
             },
         )
         .map_err(|_| EloCryptoError::Encryption)?;
-
-    let mut rec = BytesWriter::new();
-    rec.push_bytes(&header_bytes);
-    rec.push_var_bytes(&ct);
-    let record = rec.finalize();
-
-    let mut cont = BytesWriter::new();
-    cont.push_uleb128(1);
-    cont.push_var_bytes(&record);
-    Ok(cont.finalize())
+    let mut record = BytesWriter::new();
+    record.push_bytes(&header_bytes);
+    record.push_var_bytes(&ct);
+    Ok(record.finalize())
 }
 
-/// Experimental %ELO adaptor. Snapshot-only packaging is implemented today;
-/// delta packaging and API stability are WIP and may change.
+fn encode_elo_container(records: &[Vec<u8>]) -> Vec<u8> {
+    use protocol::bytes::BytesWriter;
+
+    let mut container = BytesWriter::new();
+    container.push_uleb128(records.len() as u64);
+    for record in records {
+        container.push_var_bytes(record);
+    }
+    container.finalize()
+}
+
+fn encode_elo_snapshot_container_with_vv(
+    key_id: &str,
+    key: &[u8; 32],
+    iv_generator: &EloIvGenerator,
+    used_ivs: &EloUsedIvs,
+    vv: &[(Vec<u8>, u64)],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, EloCryptoError> {
+    use protocol::bytes::BytesWriter;
+
+    let iv = next_unique_iv(iv_generator, used_ivs)?;
+    let mut header = BytesWriter::new();
+    header.push_byte(protocol::elo::EloRecordKind::Snapshot as u8);
+    header.push_uleb128(vv.len() as u64);
+    for (peer_id, counter) in vv {
+        header.push_var_bytes(peer_id);
+        header.push_uleb128(*counter);
+    }
+    header.push_var_string(key_id);
+    header.push_var_bytes(&iv);
+    let record = encrypt_elo_record(key, &iv, header.finalize(), plaintext)?;
+    Ok(encode_elo_container(&[record]))
+}
+
+#[cfg(test)]
+fn encode_elo_snapshot_container_with(
+    key_id: &str,
+    key: &[u8; 32],
+    iv_generator: &EloIvGenerator,
+    used_ivs: &EloUsedIvs,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, EloCryptoError> {
+    encode_elo_snapshot_container_with_vv(key_id, key, iv_generator, used_ivs, &[], plaintext)
+}
+
+fn encode_canonical_delta_plaintext(blob: &[u8]) -> Vec<u8> {
+    use protocol::bytes::BytesWriter;
+
+    let mut plaintext = BytesWriter::new();
+    plaintext.push_uleb128(1);
+    plaintext.push_var_bytes(blob);
+    plaintext.finalize()
+}
+
+fn decode_canonical_delta_plaintext(plaintext: &[u8]) -> Result<Vec<&[u8]>, String> {
+    use protocol::bytes::BytesReader;
+
+    const MAX_DELTA_BLOBS: usize = 1024;
+    let mut reader = BytesReader::new(plaintext);
+    let count = usize::try_from(reader.read_uleb128()?)
+        .map_err(|_| "ELO DeltaSpan blob count is too large".to_string())?;
+    if count > MAX_DELTA_BLOBS {
+        return Err("ELO DeltaSpan blob count exceeds the supported limit".to_string());
+    }
+    let mut blobs = Vec::with_capacity(count);
+    for _ in 0..count {
+        blobs.push(reader.read_var_bytes()?);
+    }
+    if reader.remaining() != 0 {
+        return Err("ELO DeltaSpan plaintext has trailing bytes".to_string());
+    }
+    Ok(blobs)
+}
+
+fn snapshot_version_entries(vv: &loro::VersionVector) -> Result<Vec<(Vec<u8>, u64)>, String> {
+    let mut entries = vv
+        .iter()
+        .map(|(peer, counter)| {
+            let counter = u64::try_from(*counter)
+                .map_err(|_| format!("negative Loro counter for peer {peer}"))?;
+            Ok((peer.to_string().into_bytes(), counter))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(entries)
+}
+
+fn encode_elo_delta_container_with(
+    doc: &LoroDoc,
+    key_id: &str,
+    key: &[u8; 32],
+    iv_generator: &EloIvGenerator,
+    used_ivs: &EloUsedIvs,
+    local_blob: &[u8],
+) -> Result<Vec<u8>, String> {
+    use protocol::bytes::BytesWriter;
+
+    let metadata = LoroDoc::decode_import_blob_meta(local_blob, true)
+        .map_err(|error| format!("cannot inspect local Loro update metadata: {error}"))?;
+    let mut spans = Vec::new();
+    for (peer, end) in metadata.partial_end_vv.iter() {
+        let start = metadata.partial_start_vv.get(peer).copied().unwrap_or(0);
+        if *end > start {
+            spans.push((*peer, start, *end));
+        }
+    }
+    spans.sort_by_key(|(peer, _, _)| peer.to_string());
+    if spans.is_empty() {
+        return Err("local Loro update contains no forward peer interval".to_string());
+    }
+
+    let mut records = Vec::with_capacity(spans.len());
+    for (peer, start, end) in spans {
+        let start_u64 = u64::try_from(start)
+            .map_err(|_| format!("negative Loro start counter for peer {peer}"))?;
+        let end_u64 =
+            u64::try_from(end).map_err(|_| format!("negative Loro end counter for peer {peer}"))?;
+        let exact_update = doc
+            .export(loro::ExportMode::updates_in_range(vec![loro::IdSpan::new(
+                peer, start, end,
+            )]))
+            .map_err(|error| format!("cannot export Loro range {peer}[{start},{end}): {error}"))?;
+        let plaintext = encode_canonical_delta_plaintext(&exact_update);
+        let iv = next_unique_iv(iv_generator, used_ivs).map_err(|error| error.to_string())?;
+        let mut header = BytesWriter::new();
+        header.push_byte(protocol::elo::EloRecordKind::DeltaSpan as u8);
+        header.push_var_bytes(peer.to_string().as_bytes());
+        header.push_uleb128(start_u64);
+        header.push_uleb128(end_u64);
+        header.push_var_string(key_id);
+        header.push_var_bytes(&iv);
+        records.push(
+            encrypt_elo_record(key, &iv, header.finalize(), &plaintext)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(encode_elo_container(&records))
+}
+
+enum EloWorkerCommand {
+    LocalUpdate(Vec<u8>),
+    Joined(protocol::Permission),
+}
+
+struct EloWorkerContext {
+    doc: Arc<Mutex<LoroDoc>>,
+    key_id: String,
+    key: [u8; 32],
+    iv_generator: EloIvGenerator,
+    used_ivs: EloUsedIvs,
+    active: EloWorkerActivity,
+    send: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+    on_error: Arc<dyn Fn(String, Vec<Vec<u8>>) + Send + Sync>,
+}
+
+impl EloWorkerContext {
+    async fn process_update(&self, blob: Vec<u8>) {
+        let result = {
+            let doc = self.doc.lock().await;
+            encode_elo_delta_container_with(
+                &doc,
+                &self.key_id,
+                &self.key,
+                &self.iv_generator,
+                &self.used_ivs,
+                &blob,
+            )
+        };
+        emit_elo_worker_result(&self.active, &self.send, &self.on_error, result, vec![blob]);
+    }
+
+    async fn process_snapshot(&self) {
+        let snapshot = {
+            let doc = self.doc.lock().await;
+            doc.export(loro::ExportMode::Snapshot)
+                .map(|plaintext| (doc.oplog_vv(), plaintext))
+                .map_err(|error| format!("cannot export Loro join snapshot: {error}"))
+        };
+        let result = snapshot.and_then(|(vv, plaintext)| {
+            let entries = snapshot_version_entries(&vv)?;
+            encode_elo_snapshot_container_with_vv(
+                &self.key_id,
+                &self.key,
+                &self.iv_generator,
+                &self.used_ivs,
+                &entries,
+                &plaintext,
+            )
+            .map_err(|error| error.to_string())
+        });
+        emit_elo_worker_result(&self.active, &self.send, &self.on_error, result, Vec::new());
+    }
+
+    fn spawn(
+        self,
+        mut receiver: mpsc::UnboundedReceiver<EloWorkerCommand>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut permission = None;
+            let mut pending = VecDeque::new();
+            while let Some(command) = receiver.recv().await {
+                match command {
+                    EloWorkerCommand::LocalUpdate(blob) => match permission {
+                        Some(protocol::Permission::Write) => self.process_update(blob).await,
+                        Some(protocol::Permission::Read) => {}
+                        None => pending.push_back(blob),
+                    },
+                    EloWorkerCommand::Joined(new_permission) => {
+                        permission = Some(new_permission);
+                        if matches!(new_permission, protocol::Permission::Write) {
+                            while let Some(blob) = pending.pop_front() {
+                                self.process_update(blob).await;
+                            }
+                            self.process_snapshot().await;
+                        } else {
+                            pending.clear();
+                        }
+                    }
+                }
+            }
+        })
+    }
+}
+
+/// Experimental %ELO adaptor with canonical DeltaSpan updates and snapshot bootstrap.
 pub struct EloDocAdaptor {
     doc: Arc<Mutex<LoroDoc>>,
     ctx: Option<CrdtAdaptorContext>,
     key_id: String,
     key: [u8; 32],
     iv_generator: EloIvGenerator,
+    used_ivs: EloUsedIvs,
+    worker_active: EloWorkerActivity,
+    worker_tx: Option<mpsc::UnboundedSender<EloWorkerCommand>>,
+    worker: Option<tokio::task::JoinHandle<()>>,
     sub: Option<loro::Subscription>,
 }
 
@@ -1459,11 +2224,18 @@ impl EloDocAdaptor {
             key_id: key_id.into(),
             key,
             iv_generator: Arc::new(secure_random_iv),
+            used_ivs: Arc::new(StdMutex::new(HashSet::new())),
+            worker_active: Arc::new(StdMutex::new(false)),
+            worker_tx: None,
+            worker: None,
             sub: None,
         }
     }
 
     /// Overrides secure IV generation with a deterministic compatibility helper.
+    ///
+    /// The factory must return a fresh IV on every call. Repeated IVs are rejected
+    /// before encryption to prevent AES-GCM nonce reuse under this adaptor's key.
     pub fn with_iv_factory(mut self, f: Arc<dyn Fn() -> [u8; 12] + Send + Sync>) -> Self {
         self.iv_generator = Arc::new(move || Ok(f()));
         self
@@ -1475,8 +2247,15 @@ impl EloDocAdaptor {
         self
     }
 
+    #[cfg(test)]
     fn encode_elo_snapshot_container(&self, plaintext: &[u8]) -> Result<Vec<u8>, EloCryptoError> {
-        encode_elo_snapshot_container_with(&self.key_id, &self.key, &self.iv_generator, plaintext)
+        encode_elo_snapshot_container_with(
+            &self.key_id,
+            &self.key,
+            &self.iv_generator,
+            &self.used_ivs,
+            plaintext,
+        )
     }
 }
 
@@ -1491,72 +2270,124 @@ impl CrdtDocAdaptor for EloDocAdaptor {
     }
 
     async fn set_ctx(&mut self, ctx: CrdtAdaptorContext) {
-        // Store context and subscribe to local updates immediately (TS parity)
+        if let Some(sub) = self.sub.take() {
+            sub.unsubscribe();
+        }
+        *self
+            .worker_active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        if let Some(worker) = self.worker.take() {
+            worker.abort();
+        }
+        self.worker_tx = None;
+        self.worker_active = Arc::new(StdMutex::new(true));
+
         self.ctx = Some(CrdtAdaptorContext {
             send_update: ctx.send_update.clone(),
             on_join_failed: ctx.on_join_failed.clone(),
             on_import_error: ctx.on_import_error.clone(),
         });
 
-        let doc = self.doc.clone();
-        let send = ctx.send_update.clone();
-        let key_id = self.key_id.clone();
-        let key = self.key;
-        let iv_generator = self.iv_generator.clone();
-        let on_error = ctx.on_import_error.clone();
-        // Subscribe to local updates and send encrypted containers for each emitted local blob.
-        // Note: minimal snapshot-record packaging with empty VV.
+        let (worker_tx, worker_rx) = mpsc::unbounded_channel();
+        self.worker = Some(
+            EloWorkerContext {
+                doc: self.doc.clone(),
+                key_id: self.key_id.clone(),
+                key: self.key,
+                iv_generator: self.iv_generator.clone(),
+                used_ivs: self.used_ivs.clone(),
+                active: self.worker_active.clone(),
+                send: ctx.send_update.clone(),
+                on_error: ctx.on_import_error.clone(),
+            }
+            .spawn(worker_rx),
+        );
+        self.worker_tx = Some(worker_tx.clone());
+
         let sub = {
-            let guard = doc.lock().await;
-            guard.subscribe_local_update(Box::new(move |bytes| {
-                match encode_elo_snapshot_container_with(&key_id, &key, &iv_generator, bytes) {
-                    Ok(container) => (send)(container),
-                    Err(error) => (on_error)(error.to_string(), Vec::new()),
-                }
-                true
+            let doc = self.doc.lock().await;
+            doc.subscribe_local_update(Box::new(move |bytes| {
+                worker_tx
+                    .send(EloWorkerCommand::LocalUpdate(bytes.clone()))
+                    .is_ok()
             }))
         };
         self.sub = Some(sub);
     }
 
-    async fn handle_join_ok(&mut self, _permission: protocol::Permission, _version: Vec<u8>) {
-        // On join, send a full encrypted snapshot to establish baseline.
-        // WIP: %ELO snapshot-only packaging; TODO: REVIEW [elo-packaging]
-        // This minimal implementation uses snapshot-only packaging and empty VV.
-        // It is correct but not optimal; consider delta packaging in a follow-up.
-        if let Ok(snap) = self.doc.lock().await.export(loro::ExportMode::Snapshot) {
-            let encrypted = self.encode_elo_snapshot_container(&snap);
+    async fn handle_join_ok(&mut self, permission: protocol::Permission, _version: Vec<u8>) {
+        let queued = match &self.worker_tx {
+            Some(worker) => worker.send(EloWorkerCommand::Joined(permission)).is_ok(),
+            None => false,
+        };
+        if !queued {
             if let Some(ctx) = &self.ctx {
-                match encrypted {
-                    Ok(container) => (ctx.send_update)(container),
-                    Err(error) => (ctx.on_import_error)(error.to_string(), Vec::new()),
-                }
+                (ctx.on_import_error)("ELO update worker is unavailable".to_string(), Vec::new());
             }
         }
-        // Subscription is established in set_ctx() to match TS behavior.
     }
 
     async fn apply_update(&mut self, updates: Vec<Vec<u8>>) {
-        for u in updates {
-            if let Ok(records) = protocol::elo::decode_elo_container(&u) {
-                for rec in records {
-                    if let Ok(parsed) = protocol::elo::parse_elo_record_header(rec) {
-                        let iv = match &parsed.header {
-                            protocol::elo::EloHeader::Delta(h) => h.iv,
-                            protocol::elo::EloHeader::Snapshot(h) => h.iv,
+        for update in updates {
+            if let Ok(records) = protocol::elo::decode_elo_container(&update) {
+                for record in records {
+                    if let Ok(parsed) = protocol::elo::parse_elo_record_header(record) {
+                        let (iv, key_id) = match &parsed.header {
+                            protocol::elo::EloHeader::Delta(header) => {
+                                (header.iv, header.key_id.as_str())
+                            }
+                            protocol::elo::EloHeader::Snapshot(header) => {
+                                (header.iv, header.key_id.as_str())
+                            }
                         };
-                        let aad = parsed.aad;
+                        if key_id != self.key_id {
+                            if let Some(ctx) = &self.ctx {
+                                (ctx.on_import_error)(
+                                    format!("unknown ELO key ID: {key_id}"),
+                                    vec![update.clone()],
+                                );
+                            }
+                            continue;
+                        }
                         let cipher = aes_gcm::Aes256Gcm::new((&self.key).into());
-                        if let Ok(pt) = cipher.decrypt(
+                        match cipher.decrypt(
                             aes_gcm::Nonce::from_slice(&iv),
                             aes_gcm::aead::Payload {
                                 msg: parsed.ct,
-                                aad,
+                                aad: parsed.aad,
                             },
                         ) {
-                            let _ = self.doc.lock().await.import(&pt);
-                        } else if let Some(ctx) = &self.ctx {
-                            (ctx.on_import_error)("decrypt failed".to_string(), vec![u.clone()]);
+                            Ok(plaintext) => {
+                                let blobs = if matches!(
+                                    parsed.kind,
+                                    protocol::elo::EloRecordKind::DeltaSpan
+                                ) {
+                                    decode_canonical_delta_plaintext(&plaintext)
+                                        .unwrap_or_else(|_| vec![plaintext.as_slice()])
+                                } else {
+                                    vec![plaintext.as_slice()]
+                                };
+                                let doc = self.doc.lock().await;
+                                for blob in blobs {
+                                    if let Err(error) = doc.import(blob) {
+                                        if let Some(ctx) = &self.ctx {
+                                            (ctx.on_import_error)(
+                                                format!("Loro import failed: {error}"),
+                                                vec![update.clone()],
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                if let Some(ctx) = &self.ctx {
+                                    (ctx.on_import_error)(
+                                        "decrypt failed".to_string(),
+                                        vec![update.clone()],
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -1569,6 +2400,14 @@ impl Drop for EloDocAdaptor {
     fn drop(&mut self) {
         if let Some(sub) = self.sub.take() {
             sub.unsubscribe();
+        }
+        self.worker_tx = None;
+        *self
+            .worker_active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        if let Some(worker) = self.worker.take() {
+            worker.abort();
         }
     }
 }
