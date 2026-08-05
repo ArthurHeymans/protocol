@@ -247,6 +247,97 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticated_adaptor_join_preserves_auth_across_retries() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should have an address");
+        let expected_auth = b"orgsync bootstrap claim".to_vec();
+        let server_auth = expected_auth.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("client should connect");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket handshake should succeed");
+            for attempt in 0..3 {
+                let Message::Binary(bytes) = websocket
+                    .next()
+                    .await
+                    .expect("join request should arrive")
+                    .expect("join frame should be readable")
+                else {
+                    panic!("join request should be binary");
+                };
+                let request = try_decode(bytes.as_ref()).expect("join request should decode");
+                let ProtocolMessage::JoinRequest {
+                    crdt,
+                    room_id,
+                    auth,
+                    ..
+                } = request
+                else {
+                    panic!("expected JoinRequest");
+                };
+                assert_eq!(auth, server_auth);
+
+                let response = if attempt == 0 {
+                    ProtocolMessage::JoinError {
+                        crdt,
+                        room_id: room_id.clone(),
+                        code: protocol::JoinErrorCode::VersionUnknown,
+                        message: "retry".to_string(),
+                        receiver_version: Some(vec![1]),
+                        app_code: None,
+                    }
+                } else {
+                    ProtocolMessage::JoinResponseOk {
+                        crdt,
+                        room_id: room_id.clone(),
+                        permission: protocol::Permission::Write,
+                        version: Vec::new(),
+                        extra: Some(Vec::new()),
+                    }
+                };
+                websocket
+                    .send(Message::Binary(
+                        encode(&response).expect("response should encode").into(),
+                    ))
+                    .await
+                    .expect("response should send");
+                if attempt == 1 {
+                    let rejoin = ProtocolMessage::RoomError {
+                        crdt,
+                        room_id,
+                        code: RoomErrorCode::RejoinSuggested,
+                        message: "refresh room state".to_string(),
+                    };
+                    websocket
+                        .send(Message::Binary(
+                            encode(&rejoin).expect("room error should encode").into(),
+                        ))
+                        .await
+                        .expect("room error should send");
+                }
+            }
+        });
+
+        let client = LoroWebsocketClient::connect(&format!("ws://{address}"))
+            .await
+            .expect("client should connect");
+        client
+            .join_with_adaptor_and_auth(
+                "room",
+                expected_auth,
+                Box::new(RecordingAdaptor::default()),
+            )
+            .await
+            .expect("authenticated join should succeed");
+        server.await.expect("test server should finish");
+    }
+
     struct BlockingAdaptor {
         started: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
@@ -302,16 +393,22 @@ mod tests {
             let mut adaptors = adaptors.lock().await;
             adaptors.insert(
                 slow_key,
-                Arc::new(Mutex::new(Box::new(BlockingAdaptor {
-                    started: started.clone(),
-                    release: release.clone(),
-                }))),
+                RegisteredAdaptor {
+                    adaptor: Arc::new(Mutex::new(Box::new(BlockingAdaptor {
+                        started: started.clone(),
+                        release: release.clone(),
+                    }))),
+                    auth: Vec::new(),
+                },
             );
             adaptors.insert(
                 fast_key,
-                Arc::new(Mutex::new(Box::new(RecordingAdaptor {
-                    updates: fast_updates.clone(),
-                }))),
+                RegisteredAdaptor {
+                    adaptor: Arc::new(Mutex::new(Box::new(RecordingAdaptor {
+                        updates: fast_updates.clone(),
+                    }))),
+                    auth: Vec::new(),
+                },
             );
         }
 
@@ -375,9 +472,12 @@ mod tests {
         let collected = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         adaptors.lock().await.insert(
             key.clone(),
-            Arc::new(Mutex::new(Box::new(RecordingAdaptor {
-                updates: collected.clone(),
-            }))),
+            RegisteredAdaptor {
+                adaptor: Arc::new(Mutex::new(Box::new(RecordingAdaptor {
+                    updates: collected.clone(),
+                }))),
+                auth: Vec::new(),
+            },
         );
 
         let batch_id = protocol::BatchId([1, 2, 3, 4, 5, 6, 7, 8]);
@@ -1476,7 +1576,14 @@ mod tests {
 }
 
 type SharedAdaptor = Arc<Mutex<Box<dyn CrdtDocAdaptor + Send + Sync>>>;
-type AdaptorRegistry = Arc<Mutex<HashMap<RoomKey, SharedAdaptor>>>;
+
+#[derive(Clone)]
+struct RegisteredAdaptor {
+    adaptor: SharedAdaptor,
+    auth: Vec<u8>,
+}
+
+type AdaptorRegistry = Arc<Mutex<HashMap<RoomKey, RegisteredAdaptor>>>;
 
 #[derive(Clone)]
 struct ConnectionWorker {
@@ -1590,7 +1697,12 @@ impl ConnectionWorker {
                 eprintln!("join error: {:?} - {}", code, message);
             }
             ProtocolMessage::DocUpdate { updates, .. } => {
-                let adaptor = self.adaptors.lock().await.get(&key).cloned();
+                let adaptor = self
+                    .adaptors
+                    .lock()
+                    .await
+                    .get(&key)
+                    .map(|registered| registered.adaptor.clone());
                 if let Some(adaptor) = adaptor {
                     adaptor.lock().await.apply_update(updates).await;
                 } else if let Some(doc) = self
@@ -1754,7 +1866,12 @@ impl ConnectionWorker {
                     reassembled.extend_from_slice(&fragment);
                 }
                 drop(map);
-                let adaptor = self.adaptors.lock().await.get(&key).cloned();
+                let adaptor = self
+                    .adaptors
+                    .lock()
+                    .await
+                    .get(&key)
+                    .map(|registered| registered.adaptor.clone());
                 if let Some(adaptor) = adaptor {
                     adaptor.lock().await.apply_update(vec![reassembled]).await;
                 } else if let Some(doc) = self
@@ -1772,9 +1889,10 @@ impl ConnectionWorker {
                 }
             }
             ProtocolMessage::RoomError { code, message, .. } => {
-                let adaptor = self.adaptors.lock().await.remove(&key);
-                if let Some(adaptor_ref) = &adaptor {
-                    adaptor_ref
+                let registered = self.adaptors.lock().await.remove(&key);
+                if let Some(registered) = &registered {
+                    registered
+                        .adaptor
                         .lock()
                         .await
                         .handle_room_error(code, &message)
@@ -1786,7 +1904,7 @@ impl ConnectionWorker {
                 eprintln!("room error {:?}: {}", code, message);
 
                 if matches!(code, RoomErrorCode::RejoinSuggested) {
-                    if let Some(shared_adaptor) = adaptor {
+                    if let Some(RegisteredAdaptor { adaptor, auth }) = registered {
                         let room_name = key.room.clone();
                         let client = LoroWebsocketClient {
                             tx: self.tx.clone(),
@@ -1800,7 +1918,7 @@ impl ConnectionWorker {
                         };
                         tokio::spawn(async move {
                             if let Err(err) = client
-                                .join_with_shared_adaptor(&room_name, shared_adaptor)
+                                .join_with_shared_adaptor(&room_name, auth, adaptor)
                                 .await
                             {
                                 eprintln!("rejoin after RoomError failed: {}", err);
@@ -1818,7 +1936,12 @@ impl ConnectionWorker {
                     map.remove(&(key.clone(), ref_id))
                 };
 
-                let adaptor = self.adaptors.lock().await.get(&key).cloned();
+                let adaptor = self
+                    .adaptors
+                    .lock()
+                    .await
+                    .get(&key)
+                    .map(|registered| registered.adaptor.clone());
                 if let Some(adaptor) = adaptor {
                     let mut adaptor = adaptor.lock().await;
                     if status != UpdateStatusCode::Ok {
@@ -2132,13 +2255,28 @@ impl LoroWebsocketClient {
         room_id: &str,
         adaptor: Box<dyn CrdtDocAdaptor + Send + Sync>,
     ) -> Result<LoroWebsocketClientRoom, ClientError> {
-        self.join_with_shared_adaptor(room_id, Arc::new(Mutex::new(adaptor)))
+        self.join_with_adaptor_and_auth(room_id, Vec::new(), adaptor)
+            .await
+    }
+
+    /// Generic join with a CRDT adaptor and application-defined join metadata.
+    ///
+    /// The authentication bytes are copied into every `JoinRequest`, including
+    /// version-negotiation retries.
+    pub async fn join_with_adaptor_and_auth(
+        &self,
+        room_id: &str,
+        auth: Vec<u8>,
+        adaptor: Box<dyn CrdtDocAdaptor + Send + Sync>,
+    ) -> Result<LoroWebsocketClientRoom, ClientError> {
+        self.join_with_shared_adaptor(room_id, auth, Arc::new(Mutex::new(adaptor)))
             .await
     }
 
     async fn join_with_shared_adaptor(
         &self,
         room_id: &str,
+        auth: Vec<u8>,
         adaptor: SharedAdaptor,
     ) -> Result<LoroWebsocketClientRoom, ClientError> {
         let crdt_type = adaptor.lock().await.crdt_type();
@@ -2247,10 +2385,13 @@ impl LoroWebsocketClient {
             .await;
 
         // Track to allow reader to route messages even before activation
-        self.adaptors
-            .lock()
-            .await
-            .insert(key.clone(), adaptor.clone());
+        self.adaptors.lock().await.insert(
+            key.clone(),
+            RegisteredAdaptor {
+                adaptor: adaptor.clone(),
+                auth: auth.clone(),
+            },
+        );
 
         // Join with version negotiation on VersionUnknown
         let mut current_version = adaptor.lock().await.version().await;
@@ -2262,7 +2403,7 @@ impl LoroWebsocketClient {
             let msg = ProtocolMessage::JoinRequest {
                 crdt: key.crdt,
                 room_id: key.room.clone(),
-                auth: Vec::new(),
+                auth: auth.clone(),
                 version: current_version.clone(),
             };
             let data = encode(&msg).map_err(ClientError::Protocol)?;
@@ -2377,7 +2518,7 @@ impl LoroWebsocketClientRoom {
             .lock()
             .await
             .get(&self.key)
-            .cloned()
+            .map(|registered| registered.adaptor.clone())
             .ok_or_else(|| ClientError::Protocol("room adaptor is unavailable".into()))?;
         let result = adaptor.lock().await.retry_pending_encrypted_records().await;
         Ok(result)
@@ -2391,7 +2532,7 @@ impl LoroWebsocketClientRoom {
             .lock()
             .await
             .get(&self.key)
-            .cloned()
+            .map(|registered| registered.adaptor.clone())
             .ok_or_else(|| ClientError::Protocol("room adaptor is unavailable".into()))?;
         let published = adaptor.lock().await.publish_elo_snapshot().await;
         Ok(published)
