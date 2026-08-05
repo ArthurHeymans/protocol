@@ -1,13 +1,18 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { LoroDoc } from "loro-crdt";
-import {
-  EloAdaptor,
-  EloKeyring,
-  type EloAdaptorError,
-} from "../src/loro";
+import { EloAdaptor, EloKeyring, type EloAdaptorError } from "../src/loro";
 import { CrdtType, MessageType } from "loro-protocol";
-import { parseEloRecordHeader, decodeEloContainer } from "loro-protocol";
-import { encryptDeltaSpan, encodeEloContainer } from "loro-protocol";
+import {
+  aesGcmDecrypt,
+  decodeEloDeltaPlaintext,
+  parseEloRecordHeader,
+  decodeEloContainer,
+} from "loro-protocol";
+import {
+  encryptDeltaSpan,
+  encryptSnapshot,
+  encodeEloContainer,
+} from "loro-protocol";
 
 const KEY_HEX =
   "0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
@@ -108,10 +113,13 @@ describe("EloAdaptor — key management", () => {
     const key1 = hexToBytes(KEY_HEX);
     const key2 = new Uint8Array(32).fill(0x22);
     const wrongKey2 = new Uint8Array(32).fill(0x33);
-    const keyring = new EloKeyring([
-      { keyId: "k1", key: key1 },
-      { keyId: "k2", key: wrongKey2 },
-    ], "k1");
+    const keyring = new EloKeyring(
+      [
+        { keyId: "k1", key: key1 },
+        { keyId: "k2", key: wrongKey2 },
+      ],
+      "k1"
+    );
     const errors: EloAdaptorError[] = [];
     const destination = new LoroDoc();
     const adaptor = new EloAdaptor(destination, {
@@ -220,12 +228,12 @@ describe("EloAdaptor — key management", () => {
     const evicted = await makeRecord("old", 1);
     const retained = await makeRecord("new", 2);
 
-    adaptor.applyUpdate([
-      encodeEloContainer([evicted, evicted, retained]),
-    ]);
+    adaptor.applyUpdate([encodeEloContainer([evicted, evicted, retained])]);
     await adaptor.retryPendingEncryptedRecords();
     expect(adaptor.pendingEncryptedRecordCount).toBe(1);
-    expect(errors.filter(error => error.kind === "unknown_key")).toHaveLength(2);
+    expect(errors.filter(error => error.kind === "unknown_key")).toHaveLength(
+      2
+    );
     expect(errors.some(error => error.kind === "pending_evicted")).toBe(true);
 
     keyring.addKey("k2", missingKey);
@@ -247,7 +255,11 @@ describe("EloAdaptor — key management", () => {
         },
       },
     });
-    const makeRecord = async (keyId: string, key: Uint8Array, ivByte: number) => {
+    const makeRecord = async (
+      keyId: string,
+      key: Uint8Array,
+      ivByte: number
+    ) => {
       const source = new LoroDoc();
       source.getText("test").insert(0, keyId);
       source.commit();
@@ -306,19 +318,29 @@ describe("EloAdaptor — key management", () => {
 
     source.getText("test").insert(0, "before");
     source.commit();
-    await vi.waitFor(() => expect(sent.length).toBe(1));
-    expect(parseEloRecordHeader(decodeEloContainer(sent[0]!)[0]!).keyId).toBe("k1");
+    await vi.waitFor(() => {
+      expect(sent.length).toBe(1);
+    });
+    expect(parseEloRecordHeader(decodeEloContainer(sent[0])[0]).keyId).toBe(
+      "k1"
+    );
 
     keyring.addKey("k2", key2);
     keyring.setActiveKey("k2");
     source.getText("test").insert(6, " after");
     source.commit();
-    await vi.waitFor(() => expect(sent.length).toBe(2));
-    expect(parseEloRecordHeader(decodeEloContainer(sent[1]!)[0]!).keyId).toBe("k2");
+    await vi.waitFor(() => {
+      expect(sent.length).toBe(2);
+    });
+    expect(parseEloRecordHeader(decodeEloContainer(sent[1])[0]).keyId).toBe(
+      "k2"
+    );
 
     await adaptor.publishSnapshot();
     const snapshot = sent.at(-1)!;
-    const snapshotHeader = parseEloRecordHeader(decodeEloContainer(snapshot)[0]!);
+    const snapshotHeader = parseEloRecordHeader(
+      decodeEloContainer(snapshot)[0]
+    );
     expect(snapshotHeader.kind).toBe(1);
     expect(snapshotHeader.keyId).toBe("k2");
 
@@ -367,15 +389,17 @@ describe("EloAdaptor — key management", () => {
     source.getText("test").insert(0, "ordered");
     source.commit();
     const publish = adaptor.publishSnapshot();
-    await vi.waitFor(() => expect(calls).toBe(1));
+    await vi.waitFor(() => {
+      expect(calls).toBe(1);
+    });
     expect(sent).toHaveLength(0);
     releaseFirst();
     await publish;
 
     expect(sent).toHaveLength(2);
     expect(
-      sent.map(container =>
-        parseEloRecordHeader(decodeEloContainer(container)[0]!).kind
+      sent.map(
+        container => parseEloRecordHeader(decodeEloContainer(container)[0]).kind
       )
     ).toEqual([0, 1]);
   });
@@ -394,10 +418,12 @@ describe("EloAdaptor — key management", () => {
     expect((await keyring.resolveKey("k1"))?.key).toEqual(
       new Uint8Array(32).fill(7)
     );
-    expect(() => keyring.addKey("k1", new Uint8Array(32).fill(7))).not.toThrow();
-    expect(() => keyring.addKey("k1", new Uint8Array(32))).toThrow(
-      "already exists"
-    );
+    expect(() => {
+      keyring.addKey("k1", new Uint8Array(32).fill(7));
+    }).not.toThrow();
+    expect(() => {
+      keyring.addKey("k1", new Uint8Array(32));
+    }).toThrow("already exists");
     expect(
       () => new EloKeyring([{ keyId: "k1", key: original }], "missing")
     ).toThrow("Unknown ELO key ID");
@@ -491,13 +517,129 @@ describe("EloAdaptor — key management", () => {
 
     source.getText("test").insert(0, "one");
     source.commit();
-    await vi.waitFor(() => expect(sent).toHaveLength(1));
+    await vi.waitFor(() => {
+      expect(sent).toHaveLength(1);
+    });
     source.getText("test").insert(3, " two");
     source.commit();
-    await vi.waitFor(() =>
-      expect(errors.some(error => error.kind === "encrypt_failed")).toBe(true)
-    );
+    await vi.waitFor(() => {
+      expect(errors.some(error => error.kind === "encrypt_failed")).toBe(true);
+    });
     expect(sent).toHaveLength(1);
+  });
+});
+
+describe("EloAdaptor — canonical delta updates", () => {
+  it("emits canonical plaintext that round trips as a Loro update", async () => {
+    const key = hexToBytes(KEY_HEX);
+    const source = new LoroDoc();
+    const sent: Uint8Array[] = [];
+    const adaptor = new EloAdaptor(source, {
+      getPrivateKey: async () => ({ keyId: "k1", key }),
+      ivFactory: () => new Uint8Array(12).fill(7),
+    });
+    adaptor.setCtx({
+      send: updates => sent.push(...updates),
+      onJoinFailed: vi.fn(),
+      onImportError: vi.fn(),
+    });
+
+    source.getText("test").insert(0, "canonical");
+    source.commit();
+    await vi.waitFor(() => {
+      expect(sent).toHaveLength(1);
+    });
+
+    const parsed = parseEloRecordHeader(decodeEloContainer(sent[0])[0]);
+    const plaintext = await aesGcmDecrypt(
+      key,
+      parsed.iv,
+      parsed.ct,
+      parsed.aad
+    );
+    const blobs = decodeEloDeltaPlaintext(plaintext);
+    expect(blobs).toHaveLength(1);
+    const destination = new LoroDoc();
+    destination.importBatch(blobs);
+    expect(destination.getText("test").toString()).toBe("canonical");
+  });
+
+  it("does not import after destruction while key resolution is pending", async () => {
+    const key = hexToBytes(KEY_HEX);
+    const source = new LoroDoc();
+    source.getText("test").insert(0, "must stay absent");
+    source.commit();
+    const { record } = await encryptSnapshot(
+      source.export({ mode: "snapshot" }),
+      { vv: [], keyId: "k1", iv: new Uint8Array(12).fill(3) },
+      key
+    );
+    let releaseKey!: () => void;
+    const keyGate = new Promise<void>(resolve => {
+      releaseKey = resolve;
+    });
+    let notifyResolution!: () => void;
+    const resolutionStarted = new Promise<void>(resolve => {
+      notifyResolution = resolve;
+    });
+    const destination = new LoroDoc();
+    const adaptor = new EloAdaptor(destination, {
+      getPrivateKey: async () => {
+        notifyResolution();
+        await keyGate;
+        return { keyId: "k1", key };
+      },
+    });
+
+    adaptor.applyUpdate([encodeEloContainer([record])]);
+    await resolutionStarted;
+    adaptor.destroy();
+    releaseKey();
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(destination.getText("test").toString()).toBe("");
+    expect(adaptor.pendingEncryptedRecordCount).toBe(0);
+  });
+
+  it("does not partially import a container with a malformed later record", async () => {
+    const key = hexToBytes(KEY_HEX);
+    const source = new LoroDoc();
+    source.getText("test").insert(0, "must stay absent");
+    source.commit();
+    const valid = await encryptDeltaSpan(
+      source.export({ mode: "update" }),
+      {
+        peerId: new TextEncoder().encode("1"),
+        start: 0,
+        end: 1,
+        keyId: "k1",
+        iv: new Uint8Array(12).fill(1),
+      },
+      key
+    );
+    const invalid = await encryptDeltaSpan(
+      new Uint8Array([0xff]),
+      {
+        peerId: new TextEncoder().encode("2"),
+        start: 0,
+        end: 1,
+        keyId: "k1",
+        iv: new Uint8Array(12).fill(2),
+      },
+      key
+    );
+    const errors: EloAdaptorError[] = [];
+    const destination = new LoroDoc();
+    const adaptor = new EloAdaptor(destination, {
+      getPrivateKey: async () => ({ keyId: "k1", key }),
+      onEloError: error => errors.push(error),
+    });
+
+    adaptor.applyUpdate([encodeEloContainer([valid.record, invalid.record])]);
+    await adaptor.retryPendingEncryptedRecords();
+
+    expect(destination.getText("test").toString()).toBe("");
+    expect(errors.some(error => error.kind === "import_failed")).toBe(true);
   });
 });
 

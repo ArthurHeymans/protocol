@@ -986,6 +986,9 @@ dependencies = [
 [[package]]
 name = "loro-protocol"
 version = "0.3.0"
+dependencies = [
+ "aes-gcm",
+]
 
 [[package]]
 name = "loro-rle"

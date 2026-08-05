@@ -31,18 +31,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     match role.as_str() {
         "sender" => {
-            // Prepare desired state before join so adaptor sends it as initial snapshot
+            let _room = client
+                .join_elo_with_adaptor(&room, doc.clone(), "k1".to_string(), KEY)
+                .await?;
+            // Edit after joining so this path exercises canonical DeltaSpan
+            // interoperability rather than only initial snapshot import.
             {
                 let d = doc.lock().await;
                 d.get_text("t").insert(0, "hi").unwrap();
                 d.commit();
             }
-            let _room = client
-                .join_elo_with_adaptor(&room, doc.clone(), "k1".to_string(), KEY)
-                .await?;
-            // Allow time for the async writer and server broadcast to complete.
-            // Align with JS wrapper's 800ms flush to avoid flakiness in cross-lang tests.
-            sleep(Duration::from_millis(800)).await;
+            // Allow the async writer, relay indexing, and late-join backfill to complete.
+            sleep(Duration::from_millis(1_500)).await;
             Ok(())
         }
         "receiver" => {

@@ -44,6 +44,8 @@ import {
   encryptSnapshot,
   encryptDeltaSpan,
   decryptEloRecord,
+  encodeEloDeltaPlaintext,
+  decodeEloDeltaPlaintext,
   encodeEloContainer,
   decodeEloContainer,
   parseEloRecordHeader,
@@ -52,8 +54,22 @@ import {
 // Encrypt a snapshot
 const key = crypto.getRandomValues(new Uint8Array(32));
 const plaintext = new Uint8Array([1, 2, 3]);
-const { record } = await encryptSnapshot(plaintext, { vv: [], keyId: "k1" }, key);
-const container = encodeEloContainer([record]);
+const { record } = await encryptSnapshot(
+  plaintext,
+  { vv: [], keyId: "k1" },
+  key
+);
+
+// DeltaSpan plaintext is a canonical bounded list of Loro update blobs.
+const loroUpdate = new Uint8Array([4, 5, 6]);
+const deltaPlaintext = encodeEloDeltaPlaintext([loroUpdate]);
+const blobs = decodeEloDeltaPlaintext(deltaPlaintext);
+const delta = await encryptDeltaSpan(
+  deltaPlaintext,
+  { peerId: new TextEncoder().encode("42"), start: 0, end: 1, keyId: "k1" },
+  key
+);
+const container = encodeEloContainer([record, delta.record]);
 
 // Later, parse and decrypt
 const [rec] = decodeEloContainer(container);
@@ -63,6 +79,7 @@ console.log(parsed.kind === EloRecordKind.Snapshot, out.plaintext);
 ```
 
 Notes
+
 - A relay without the document key cannot decrypt `ct`, but it parses the plaintext %ELO headers to index/backfill.
 - Room IDs and ELO routing headers are visible to the relay and any TLS terminator. Headers expose record kind; raw peer IDs and delta `start`/`end` counters or snapshot peer/counter version-vector entries; `keyId`; and IV. Traffic timing and sizes remain observable. Use non-sensitive `keyId` labels; IVs are public but must be unique per key.
 - Prefer a non-semantic base64url or hex room alias generated from at least 128 random bits from a CSPRNG. The alias remains visible to the server, can be correlated, and is not a credential; authenticate and authorize separately.
@@ -73,7 +90,7 @@ Notes
 
 - Encoding/decoding: `encode(msg)`, `decode(buf)`, `tryDecode(buf)`
 - Bytes: `BytesWriter`, `BytesReader`
-- %ELO: `encodeEloContainer`, `decodeEloContainer`, `parseEloRecordHeader`, `encryptSnapshot`, `encryptDeltaSpan`, `decryptEloRecord`
+- %ELO: `encodeEloContainer`, `decodeEloContainer`, `encodeEloDeltaPlaintext`, `decodeEloDeltaPlaintext`, `parseEloRecordHeader`, `encryptSnapshot`, `encryptDeltaSpan`, `decryptEloRecord`
 
 ## Node/Web Compatibility
 

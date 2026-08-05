@@ -140,6 +140,23 @@ describe("EloDoc opaque retention", () => {
     expect(decodeEloContainer(doc.exportIndexedRecords())).toEqual([retained]);
   });
 
+  it("chunks large retained backfill into bounded containers", () => {
+    const records = [
+      deltaRecord(bytes("1"), 0, 1, 1, "key", 12, 100 * 1024),
+      deltaRecord(bytes("2"), 0, 1, 2, "key", 12, 100 * 1024),
+      deltaRecord(bytes("3"), 0, 1, 3, "key", 12, 100 * 1024),
+    ];
+    const doc = new EloDoc();
+    expect(doc.indexBatch(encodeEloContainer(records))).toEqual({ ok: true });
+
+    const batches = doc.selectBackfillBatches(new Uint8Array());
+    expect(batches.length).toBeGreaterThan(1);
+    expect(batches.every(batch => batch.length <= 240 * 1024)).toBe(true);
+    expect(batches.flatMap(batch => decodeEloContainer(batch))).toEqual(
+      records
+    );
+  });
+
   it("omits counters that cannot be represented by a Loro version vector", () => {
     const doc = new EloDoc();
     expect(
@@ -162,7 +179,8 @@ function deltaRecord(
   end: number,
   marker: number,
   keyId = "key-1",
-  ivLength = 12
+  ivLength = 12,
+  ciphertextLength = 16
 ): Uint8Array {
   const writer = new BytesWriter();
   writer.pushByte(0x00);
@@ -171,7 +189,7 @@ function deltaRecord(
   writer.pushUleb128(end);
   writer.pushVarString(keyId);
   writer.pushVarBytes(new Uint8Array(ivLength).fill(marker));
-  writer.pushVarBytes(new Uint8Array([marker]));
+  writer.pushVarBytes(new Uint8Array(ciphertextLength).fill(marker));
   return writer.finalize();
 }
 
@@ -207,7 +225,7 @@ function snapshotRecord(
   }
   writer.pushVarString("key-1");
   writer.pushVarBytes(new Uint8Array(12).fill(marker));
-  writer.pushVarBytes(new Uint8Array([marker]));
+  writer.pushVarBytes(new Uint8Array(16).fill(marker));
   return writer.finalize();
 }
 

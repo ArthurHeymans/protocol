@@ -86,7 +86,11 @@ export class BytesReader {
   }
 
   readBytes(len: number): Uint8Array {
-    if (len < 0 || this.offset + len > this.buf.length) {
+    if (
+      !Number.isSafeInteger(len) ||
+      len < 0 ||
+      this.offset + len > this.buf.length
+    ) {
       throw new Error("readBytes out of bounds");
     }
     const out = this.buf.subarray(this.offset, this.offset + len);
@@ -118,7 +122,7 @@ export class BytesReader {
 
   readVarString(): string {
     const bytes = this.readVarBytes();
-    const dec = new TextDecoder();
+    const dec = new TextDecoder("utf-8", { fatal: true });
     return dec.decode(bytes);
   }
 }

@@ -15,3 +15,6 @@ path = "src/lib.rs"
 
 [features]
 default = []
+
+[dev-dependencies]
+aes-gcm = { version = "0.10", features = ["aes"] }

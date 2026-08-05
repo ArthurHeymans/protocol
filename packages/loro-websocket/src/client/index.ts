@@ -1,24 +1,24 @@
 import {
-  CrdtType,
-  ProtocolMessage,
+  type CrdtType,
+  type ProtocolMessage,
   tryDecode,
   MessageType,
-  JoinResponseOk,
+  type JoinResponseOk,
   encode,
-  JoinRequest,
-  DocUpdate,
-  JoinError,
-  DocUpdateFragmentHeader,
-  DocUpdateFragment,
-  Ack,
-  RoomError,
+  type JoinRequest,
+  type DocUpdate,
+  type JoinError,
+  type DocUpdateFragmentHeader,
+  type DocUpdateFragment,
+  type Ack,
+  type RoomError,
   RoomErrorCode,
   UpdateStatusCode,
-  Leave,
+  type Leave,
   JoinErrorCode,
   MAX_MESSAGE_SIZE,
   bytesToHex,
-  HexString,
+  type HexString,
 } from "loro-protocol";
 import type { CrdtDocAdaptor } from "loro-adaptors";
 
@@ -30,6 +30,7 @@ type AuthOption = Uint8Array | AuthProvider;
 interface FragmentBatch {
   header: DocUpdateFragmentHeader;
   fragments: Map<number, Uint8Array>;
+  receivedBytes: number;
   timeoutId: ReturnType<typeof setTimeout>;
 }
 
@@ -41,6 +42,13 @@ interface PendingRoom {
   roomId: string;
   auth?: AuthOption;
   isRejoin?: boolean;
+  joinVersion?: Uint8Array;
+  joinWasSent?: boolean;
+}
+
+interface QueuedJoin {
+  roomKey: string;
+  payload: Uint8Array;
 }
 
 interface InternalRoomHandler {
@@ -108,6 +116,14 @@ export interface LoroWebsocketClientOptions {
   onWsClose?: () => void;
   /** Optional callback for any client-level errors (socket error, decode/apply failures, send on closed, etc.). */
   onError?: (error: Error) => void;
+  /** Maximum fragments accepted in one server batch. Defaults to 64. */
+  maxFragmentsPerBatch?: number;
+  /** Maximum reassembled bytes accepted in one server batch. Defaults to 8 MiB. */
+  maxFragmentBatchBytes?: number;
+  /** Maximum incomplete server batches retained at once. Defaults to 8. */
+  maxInflightFragmentBatches?: number;
+  /** Maximum declared bytes retained across incomplete batches. Defaults to 16 MiB. */
+  maxInflightFragmentBytes?: number;
   /**
    * Reconnect policy (kept minimal).
    * - enabled: toggle auto-retry (default true)
@@ -152,6 +168,12 @@ export type RoomJoinStatusValue =
  * - `onLatency(cb)`: called when a new RTT estimate is measured from ping/pong.
  */
 export class LoroWebsocketClient {
+  private static readonly DEFAULT_MAX_FRAGMENTS_PER_BATCH = 64;
+  private static readonly DEFAULT_MAX_FRAGMENT_BATCH_BYTES = 8 * 1024 * 1024;
+  private static readonly DEFAULT_MAX_INFLIGHT_FRAGMENT_BATCHES = 8;
+  private static readonly DEFAULT_MAX_INFLIGHT_FRAGMENT_BYTES =
+    16 * 1024 * 1024;
+
   private ws!: WebSocket;
   // Invariant: `connectedPromise` always represents the next transition to `Connected`.
   // - It resolves exactly once, when the currently active socket fires `open`.
@@ -171,9 +193,15 @@ export class LoroWebsocketClient {
   private pendingRooms: Map<string, PendingRoom> = new Map();
   private activeRooms: Map<string, ActiveRoom> = new Map();
   // Buffer for %ELO only: backfills can arrive immediately after JoinResponseOk
-  private preJoinUpdates: Map<string, Array<{ updates: Uint8Array[]; refId?: HexString }>> = new Map();
+  private preJoinUpdates: Map<
+    string,
+    Array<{ updates: Uint8Array[]; refId?: HexString }>
+  > = new Map();
   // Track outbound update batches so we can surface errors with payload context
-  private sentUpdateBatches: Map<HexString, { roomKey: string; updates: Uint8Array[] }> = new Map();
+  private sentUpdateBatches: Map<
+    HexString,
+    { roomKey: string; updates: Uint8Array[] }
+  > = new Map();
   private fragmentBatches: Map<string, FragmentBatch> = new Map();
   private roomAdaptors: Map<string, CrdtDocAdaptor> = new Map();
   // Track roomId for each active id so we can rejoin on reconnect
@@ -181,7 +209,13 @@ export class LoroWebsocketClient {
   private roomAuth: Map<string, AuthOption | undefined> = new Map();
   private roomStatusListeners: Map<
     string,
-    Set<(s: RoomJoinStatusValue, messageType?: MessageType, messageCode?: number) => void>
+    Set<
+      (
+        s: RoomJoinStatusValue,
+        messageType?: MessageType,
+        messageCode?: number
+      ) => void
+    >
   > = new Map();
   private socketListeners = new WeakMap<WebSocket, SocketListeners>();
 
@@ -201,7 +235,7 @@ export class LoroWebsocketClient {
   private offline = false;
 
   // Join requests issued while socket is still connecting
-  private queuedJoins: Uint8Array[] = [];
+  private queuedJoins: QueuedJoin[] = [];
 
   constructor(private ops: LoroWebsocketClientOptions) {
     this.attachNetworkListeners();
@@ -241,7 +275,7 @@ export class LoroWebsocketClient {
       };
     });
     // prevent unhandled rejection if nobody awaits
-    void this.connectedPromise.catch(() => { });
+    void this.connectedPromise.catch(() => {});
   }
 
   private attachNetworkListeners(): void {
@@ -433,7 +467,9 @@ export class LoroWebsocketClient {
       this.detachSocketListeners(ws);
       try {
         ws.close(1000, "Superseded");
-      } catch { }
+      } catch (error) {
+        void error;
+      }
       return;
     }
     this.clearReconnectTimer();
@@ -441,9 +477,12 @@ export class LoroWebsocketClient {
     this.setStatus(ClientStatus.Connected);
     this.startPingTimer();
     this.resolveConnected?.();
-    // Rejoin rooms after reconnect
+    // Rejoin rooms after reconnect.
     this.rejoinActiveRooms();
-    // Flush any queued joins that were requested while connecting
+    // Initial joins that were already written before a disconnect are not in
+    // queuedJoins, so regenerate them with fresh auth before flushing joins that
+    // were never written successfully.
+    this.retrySentPendingRooms();
     this.flushQueuedJoins();
   }
 
@@ -511,7 +550,12 @@ export class LoroWebsocketClient {
       const err = new Error(
         closeReason ? `Disconnected: ${closeReason}` : "Disconnected"
       );
-      this.failAllPendingRooms(err, this.shouldReconnect ? RoomJoinStatus.Reconnecting : RoomJoinStatus.Disconnected);
+      this.failAllPendingRooms(
+        err,
+        this.shouldReconnect
+          ? RoomJoinStatus.Reconnecting
+          : RoomJoinStatus.Disconnected
+      );
       return;
     }
     // Renew the promise so callers waiting on waitConnected() block until the next successful reconnect.
@@ -582,7 +626,9 @@ export class LoroWebsocketClient {
       this.setStatus(ClientStatus.Disconnected);
       try {
         this.ws?.close(1001, "Offline");
-      } catch { }
+      } catch (error) {
+        void error;
+      }
     }
   };
 
@@ -593,7 +639,13 @@ export class LoroWebsocketClient {
       if (!roomId) continue;
       const active = this.activeRooms.get(id);
       if (!active) continue;
-      void this.sendRejoinRequest(id, roomId, adaptor, active.room, this.roomAuth.get(id));
+      void this.sendRejoinRequest(
+        id,
+        roomId,
+        adaptor,
+        active.room,
+        this.roomAuth.get(id)
+      );
     }
   }
 
@@ -625,7 +677,11 @@ export class LoroWebsocketClient {
           })
           .finally(() => {
             this.pendingRooms.delete(id);
-            this.emitRoomStatus(id, RoomJoinStatus.Joined, MessageType.JoinResponseOk);
+            this.emitRoomStatus(
+              id,
+              RoomJoinStatus.Joined,
+              MessageType.JoinResponseOk
+            );
           });
       },
       reject: (error: Error) => {
@@ -650,7 +706,8 @@ export class LoroWebsocketClient {
     } as JoinRequest);
 
     try {
-      this.sendJoinPayload(payload);
+      pending.joinVersion = adaptor.getVersion();
+      pending.joinWasSent = this.sendJoinPayload(payload, id);
       this.emitRoomStatus(id, RoomJoinStatus.Reconnecting);
     } catch (e) {
       console.error("Failed to send rejoin request:", e);
@@ -714,11 +771,22 @@ export class LoroWebsocketClient {
         // Drop any in-flight join since the server explicitly removed us
         this.pendingRooms.delete(roomId);
         if (shouldRejoin && active && adaptor) {
-          void this.sendRejoinRequest(roomId, msg.roomId, adaptor, active.room, auth);
+          void this.sendRejoinRequest(
+            roomId,
+            msg.roomId,
+            adaptor,
+            active.room,
+            auth
+          );
         } else {
           // Remove local room state so client does not auto-retry unless requested
           this.cleanupRoom(msg.roomId, msg.crdt);
-          this.emitRoomStatus(roomId, RoomJoinStatus.Error, MessageType.RoomError, msg.code);
+          this.emitRoomStatus(
+            roomId,
+            RoomJoinStatus.Error,
+            MessageType.RoomError,
+            msg.code
+          );
         }
         break;
       }
@@ -734,18 +802,54 @@ export class LoroWebsocketClient {
 
   private handleFragmentHeader(msg: DocUpdateFragmentHeader) {
     const roomIdStr = msg.roomId;
+    const roomKey = msg.crdt + roomIdStr;
     const batchKey = `${msg.crdt}-${roomIdStr}-${msg.batchId}`;
-
-    // Clear any existing batch with same ID
-    const existing = this.fragmentBatches.get(batchKey);
-    if (existing) {
-      clearTimeout(existing.timeoutId);
+    if (!this.activeRooms.has(roomKey) && !this.pendingRooms.has(roomKey)) {
+      this.emitError(
+        new Error("Received fragment header for an unjoined room")
+      );
+      return;
     }
 
-    // Set up timeout (10 seconds default)
+    const existing = this.fragmentBatches.get(batchKey);
+    const maxFragments =
+      this.ops.maxFragmentsPerBatch ??
+      LoroWebsocketClient.DEFAULT_MAX_FRAGMENTS_PER_BATCH;
+    const maxBatchBytes =
+      this.ops.maxFragmentBatchBytes ??
+      LoroWebsocketClient.DEFAULT_MAX_FRAGMENT_BATCH_BYTES;
+    const maxBatches =
+      this.ops.maxInflightFragmentBatches ??
+      LoroWebsocketClient.DEFAULT_MAX_INFLIGHT_FRAGMENT_BATCHES;
+    const maxInflightBytes =
+      this.ops.maxInflightFragmentBytes ??
+      LoroWebsocketClient.DEFAULT_MAX_INFLIGHT_FRAGMENT_BYTES;
+    const inflightBytes = Array.from(this.fragmentBatches.values()).reduce(
+      (total, batch) => total + batch.header.totalSizeBytes,
+      0
+    );
+    const valid =
+      Number.isSafeInteger(msg.fragmentCount) &&
+      msg.fragmentCount > 0 &&
+      msg.fragmentCount <= maxFragments &&
+      Number.isSafeInteger(msg.totalSizeBytes) &&
+      msg.totalSizeBytes > 0 &&
+      msg.totalSizeBytes <= maxBatchBytes &&
+      this.fragmentBatches.size + (existing ? 0 : 1) <= maxBatches &&
+      inflightBytes -
+        (existing?.header.totalSizeBytes ?? 0) +
+        msg.totalSizeBytes <=
+        maxInflightBytes;
+    if (!valid) {
+      this.emitError(
+        new Error("Rejected invalid or over-limit fragment header")
+      );
+      return;
+    }
+    if (existing) clearTimeout(existing.timeoutId);
+
     const timeoutId = setTimeout(() => {
       this.fragmentBatches.delete(batchKey);
-      // Notify server to prompt resend
       try {
         const payload = encode({
           type: MessageType.Ack,
@@ -755,12 +859,15 @@ export class LoroWebsocketClient {
           status: UpdateStatusCode.FragmentTimeout,
         } as Ack);
         this.safeSend(this.ws, payload, "fragment-timeout-ack");
-      } catch { }
+      } catch (error) {
+        void error;
+      }
     }, 10000);
 
     this.fragmentBatches.set(batchKey, {
       header: msg,
       fragments: new Map(),
+      receivedBytes: 0,
       timeoutId,
     });
   }
@@ -775,22 +882,40 @@ export class LoroWebsocketClient {
       return;
     }
 
+    if (
+      msg.roomId !== batch.header.roomId ||
+      msg.crdt !== batch.header.crdt ||
+      !Number.isSafeInteger(msg.index) ||
+      msg.index < 0 ||
+      msg.index >= batch.header.fragmentCount ||
+      msg.fragment.length > MAX_MESSAGE_SIZE ||
+      batch.fragments.has(msg.index) ||
+      batch.receivedBytes + msg.fragment.length > batch.header.totalSizeBytes
+    ) {
+      clearTimeout(batch.timeoutId);
+      this.fragmentBatches.delete(batchKey);
+      this.emitError(new Error("Rejected invalid fragment"));
+      return;
+    }
     batch.fragments.set(msg.index, msg.fragment);
+    batch.receivedBytes += msg.fragment.length;
 
-    // Check if all fragments received
     if (batch.fragments.size === batch.header.fragmentCount) {
       clearTimeout(batch.timeoutId);
       this.fragmentBatches.delete(batchKey);
+      if (batch.receivedBytes !== batch.header.totalSizeBytes) {
+        this.emitError(new Error("Fragment bytes do not match declared total"));
+        return;
+      }
 
-      // Reassemble fragments
       const reassembledData = new Uint8Array(batch.header.totalSizeBytes);
       let offset = 0;
-
-      // Reassemble in order
       for (let i = 0; i < batch.header.fragmentCount; i++) {
         const fragment = batch.fragments.get(i);
         if (!fragment) {
-          console.error(`Missing fragment ${i} in batch ${msg.batchId}`);
+          this.emitError(
+            new Error(`Missing fragment ${i} in batch ${msg.batchId}`)
+          );
           return;
         }
 
@@ -877,7 +1002,8 @@ export class LoroWebsocketClient {
           auth: authValue,
           version: alternativeVersion,
         } as JoinRequest);
-        this.sendJoinPayload(payload);
+        pending.joinVersion = alternativeVersion;
+        pending.joinWasSent = this.sendJoinPayload(payload, roomId);
         return;
       } else {
         console.warn("Version unknown. Now join with an empty version");
@@ -888,7 +1014,8 @@ export class LoroWebsocketClient {
           auth: authValue,
           version: new Uint8Array(),
         } as JoinRequest);
-        this.sendJoinPayload(payload);
+        pending.joinVersion = new Uint8Array();
+        pending.joinWasSent = this.sendJoinPayload(payload, roomId);
         return;
       }
     }
@@ -989,7 +1116,11 @@ export class LoroWebsocketClient {
     roomId: string;
     crdtAdaptor: CrdtDocAdaptor;
     auth?: AuthOption;
-    onStatusChange?: (s: RoomJoinStatusValue, messageType?: MessageType, messageCode?: number) => void;
+    onStatusChange?: (
+      s: RoomJoinStatusValue,
+      messageType?: MessageType,
+      messageCode?: number
+    ) => void;
   }): Promise<LoroWebsocketClientRoom> {
     const id = crdtAdaptor.crdtType + roomId;
     // Check if already joining or joined
@@ -1021,7 +1152,7 @@ export class LoroWebsocketClient {
     }
     this.emitRoomStatus(id, RoomJoinStatus.Connecting);
 
-    const room = response.then(res => {
+    const room = response.then(async res => {
       // Set adaptor ctx first so it's ready to send updates
       crdtAdaptor.setCtx({
         send: (updates: Uint8Array[]) => {
@@ -1049,32 +1180,39 @@ export class LoroWebsocketClient {
           console.error(`Import error: ${error.message}`, data);
         },
       });
-      // Create room and register before invoking adaptor.handleJoinOk to ensure
-      // any immediate backfills from the server are routed to the adaptor.
+      // Keep the room pending while the adaptor reconciles. Backfills received
+      // during this await remain buffered and are flushed in wire order only
+      // after initialization succeeds.
       const { room, handler } = createLoroWebsocketClientRoom({
         client: this,
         roomId,
         crdtType: crdtAdaptor.crdtType,
         crdtAdaptor,
       });
-      this.registerActiveRoom(
-        roomId,
-        crdtAdaptor.crdtType,
-        room,
-        handler,
-        crdtAdaptor
-      );
-      crdtAdaptor.handleJoinOk(res).catch(e => {
-        console.error(e);
-      });
-      return room;
+      try {
+        await crdtAdaptor.handleJoinOk(res);
+        this.registerActiveRoom(
+          roomId,
+          crdtAdaptor.crdtType,
+          room,
+          handler,
+          crdtAdaptor
+        );
+        return room;
+      } catch (error) {
+        const cause = error instanceof Error ? error : new Error(String(error));
+        this.emitError(cause);
+        this.emitRoomStatus(id, RoomJoinStatus.Error);
+        this.cleanupRoom(roomId, crdtAdaptor.crdtType);
+        throw cause;
+      }
     });
 
     // Register pending room immediately so concurrent join calls dedupe
     this.pendingRooms.set(id, {
       room,
-      resolve: resolve!,
-      reject: reject!,
+      resolve,
+      reject,
       adaptor: crdtAdaptor,
       roomId,
       auth,
@@ -1083,15 +1221,19 @@ export class LoroWebsocketClient {
 
     void this.resolveAuth(auth)
       .then(authValue => {
+        const pending = this.pendingRooms.get(id);
+        if (!pending) return;
+        const version = crdtAdaptor.getVersion();
+        pending.joinVersion = version;
         const joinPayload = encode({
           type: MessageType.JoinRequest,
           crdt: crdtAdaptor.crdtType,
           roomId,
           auth: authValue,
-          version: crdtAdaptor.getVersion(),
+          version,
         } as JoinRequest);
 
-        this.sendJoinPayload(joinPayload);
+        pending.joinWasSent = this.sendJoinPayload(joinPayload, id);
       })
       .catch(err => {
         const error = err instanceof Error ? err : new Error(String(err));
@@ -1113,7 +1255,7 @@ export class LoroWebsocketClient {
     this.clearPingTimer();
     this.reconnectAttempts = 0;
     this.rejectConnected?.(new Error("Disconnected"));
-    void this.connectedPromise?.catch(() => { });
+    void this.connectedPromise?.catch(() => {});
     this.rejectConnected = undefined;
     this.resolveConnected = undefined;
     this.rejectAllPingWaiters(new Error("Disconnected"));
@@ -1121,7 +1263,9 @@ export class LoroWebsocketClient {
       for (const [, batch] of this.fragmentBatches) {
         try {
           clearTimeout(batch.timeoutId);
-        } catch { }
+        } catch (error) {
+          void error;
+        }
       }
       this.fragmentBatches.clear();
     }
@@ -1256,7 +1400,9 @@ export class LoroWebsocketClient {
     }
   }
 
-  consumeSentBatch(refId: HexString): { roomKey: string; updates: Uint8Array[] } | undefined {
+  consumeSentBatch(
+    refId: HexString
+  ): { roomKey: string; updates: Uint8Array[] } | undefined {
     const entry = this.sentUpdateBatches.get(refId);
     if (entry) {
       this.sentUpdateBatches.delete(refId);
@@ -1282,7 +1428,7 @@ export class LoroWebsocketClient {
     this.clearPingTimer();
     this.reconnectAttempts = 0;
     this.rejectConnected?.(new Error("Destroyed"));
-    void this.connectedPromise?.catch(() => { });
+    void this.connectedPromise?.catch(() => {});
     this.rejectConnected = undefined;
     this.resolveConnected = undefined;
     this.rejectAllPingWaiters(new Error("Destroyed"));
@@ -1290,7 +1436,9 @@ export class LoroWebsocketClient {
       for (const [, batch] of this.fragmentBatches) {
         try {
           clearTimeout(batch.timeoutId);
-        } catch { }
+        } catch (error) {
+          void error;
+        }
       }
       this.fragmentBatches.clear();
     }
@@ -1304,7 +1452,9 @@ export class LoroWebsocketClient {
     this.detachSocketListeners(ws);
     try {
       this.removeNetworkListeners?.();
-    } catch { }
+    } catch (error) {
+      void error;
+    }
     this.removeNetworkListeners = undefined;
     this.roomStatusListeners.clear();
     // Close websocket after flushing pending frames
@@ -1313,7 +1463,9 @@ export class LoroWebsocketClient {
         code: 1000,
         reason: "Client destroyed",
       });
-    } catch { }
+    } catch (error) {
+      void error;
+    }
     this.setStatus(ClientStatus.Disconnected);
   }
 
@@ -1332,7 +1484,9 @@ export class LoroWebsocketClient {
     const safeClose = () => {
       try {
         ws.close(code, reason);
-      } catch { }
+      } catch (error) {
+        void error;
+      }
     };
 
     if (readBufferedAmount() == null) {
@@ -1377,7 +1531,9 @@ export class LoroWebsocketClient {
       ws.removeEventListener?.("error", handlers.error);
       ws.removeEventListener?.("close", handlers.close);
       ws.removeEventListener?.("message", handlers.message);
-    } catch { }
+    } catch (error) {
+      void error;
+    }
     this.socketListeners.delete(ws);
   }
 
@@ -1456,7 +1612,9 @@ export class LoroWebsocketClient {
       try {
         clearTimeout(w.timeoutId);
         w.reject(err);
-      } catch { }
+      } catch (error) {
+        void error;
+      }
     }
   }
 
@@ -1493,10 +1651,7 @@ export class LoroWebsocketClient {
     const max = policy.maxDelayMs;
     const raw = base * 2 ** Math.max(0, attempt - 1);
     const jitterFactor =
-      1 +
-      (policy.jitter === 0
-        ? 0
-        : (Math.random() * 2 - 1) * policy.jitter);
+      1 + (policy.jitter === 0 ? 0 : (Math.random() * 2 - 1) * policy.jitter);
     const withJitter = raw * jitterFactor;
     return Math.min(max, Math.max(0, Math.floor(withJitter)));
   }
@@ -1544,30 +1699,66 @@ export class LoroWebsocketClient {
     return false;
   }
 
-  private enqueueJoin(payload: Uint8Array) {
-    this.queuedJoins.push(payload);
+  private enqueueJoin(payload: Uint8Array, roomKey: string) {
+    this.queuedJoins = this.queuedJoins.filter(item => item.roomKey !== roomKey);
+    this.queuedJoins.push({ roomKey, payload });
   }
 
-  private sendJoinPayload(payload: Uint8Array) {
-    if (this.safeSend(this.ws, payload, "join")) return;
-    this.enqueueJoin(payload);
+  private sendJoinPayload(payload: Uint8Array, roomKey: string): boolean {
+    if (this.safeSend(this.ws, payload, "join")) return true;
+    this.enqueueJoin(payload, roomKey);
     void this.connect();
+    return false;
+  }
+
+  private retrySentPendingRooms(): void {
+    for (const [roomKey, pending] of this.pendingRooms) {
+      if (pending.isRejoin || !pending.joinWasSent) continue;
+      pending.joinWasSent = false;
+      void this.resolveAuth(pending.auth)
+        .then(auth => {
+          if (this.pendingRooms.get(roomKey) !== pending) return;
+          const payload = encode({
+            type: MessageType.JoinRequest,
+            crdt: pending.adaptor.crdtType,
+            roomId: pending.roomId,
+            auth,
+            version: pending.joinVersion ?? pending.adaptor.getVersion(),
+          } as JoinRequest);
+          pending.joinWasSent = this.sendJoinPayload(payload, roomKey);
+        })
+        .catch(error => {
+          const cause =
+            error instanceof Error ? error : new Error(String(error));
+          pending.reject(cause);
+          this.cleanupRoom(pending.roomId, pending.adaptor.crdtType);
+          this.emitRoomStatus(roomKey, RoomJoinStatus.Error);
+        });
+    }
   }
 
   private flushQueuedJoins() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     if (!this.queuedJoins.length) return;
     const items = this.queuedJoins.splice(0, this.queuedJoins.length);
-    for (const payload of items) {
+    for (const item of items) {
       try {
-        this.ws.send(payload);
+        this.ws.send(item.payload);
+        const pending = this.pendingRooms.get(item.roomKey);
+        if (pending) pending.joinWasSent = true;
       } catch (e) {
+        this.enqueueJoin(item.payload, item.roomKey);
         console.error("Failed to flush queued join:", e);
       }
     }
   }
 
-  private emitRoomStatus(roomKey: string, status: RoomJoinStatusValue, messageType?: MessageType, messageCode?: number) {
+  private emitRoomStatus(
+    roomKey: string,
+    status: RoomJoinStatusValue,
+    messageType?: MessageType,
+    messageCode?: number
+  ) {
     const set = this.roomStatusListeners.get(roomKey);
     if (!set || set.size === 0) return;
     for (const cb of Array.from(set)) {
@@ -1584,13 +1775,19 @@ export class LoroWebsocketClient {
     for (const [id, pending] of entries) {
       try {
         this.emitRoomStatus(id, status);
-      } catch { }
+      } catch (error) {
+        void error;
+      }
       try {
         pending.reject(err);
-      } catch { }
+      } catch (error) {
+        void error;
+      }
       try {
         this.cleanupRoom(pending.roomId, pending.adaptor.crdtType);
-      } catch { }
+      } catch (error) {
+        void error;
+      }
       this.pendingRooms.delete(id);
     }
   }
@@ -1609,7 +1806,8 @@ export interface LoroWebsocketClientRoom {
 }
 
 class LoroWebsocketClientRoomImpl
-  implements LoroWebsocketClientRoom, InternalRoomHandler {
+  implements LoroWebsocketClientRoom, InternalRoomHandler
+{
   private client: LoroWebsocketClient;
   private roomId: string;
   private crdtType: CrdtType;
@@ -1671,7 +1869,9 @@ class LoroWebsocketClientRoomImpl
       const reason = updateStatusToReason(ack.status);
       this.crdtAdaptor.onUpdateError?.(updates, ack.status, reason);
       if (!sent) {
-        console.warn(`Ack status ${ack.status} for ${this.crdtType}:${this.roomId} (ref ${ack.refId}) with no matching batch`);
+        console.warn(
+          `Ack status ${ack.status} for ${this.crdtType}:${this.roomId} (ref ${ack.refId}) with no matching batch`
+        );
       }
     }
   }

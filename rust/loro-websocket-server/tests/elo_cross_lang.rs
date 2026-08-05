@@ -17,70 +17,52 @@ fn workspace_pkg_dir() -> PathBuf {
         .join("packages/loro-websocket")
 }
 
+fn repository_root() -> PathBuf {
+    workspace_pkg_dir()
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("package must be inside the repository")
+        .to_path_buf()
+}
+
+fn tsx_command() -> Command {
+    let tsx_dist = repository_root().join("node_modules/tsx/dist");
+    let mut command = Command::new("node");
+    command
+        .arg("--require")
+        .arg(tsx_dist.join("preflight.cjs"))
+        .arg("--import")
+        .arg(format!("file://{}", tsx_dist.join("loader.mjs").display()));
+    command
+}
+
 async fn run_tsx_in_pkg(ts_file_rel: &str, extra: &[&str]) -> io::Result<std::process::ExitStatus> {
-    // Prefer pnpm exec in package dir; fallback to npx
     let pkg_dir = workspace_pkg_dir();
     eprintln!(
-        "[test] run_tsx_in_pkg: pnpm exec tsx {ts_file_rel} {}",
+        "[test] run_tsx_in_pkg: tsx {ts_file_rel} {}",
         extra.join(" ")
     );
-    let status = Command::new("pnpm")
-        .current_dir(&pkg_dir)
-        .arg("exec")
-        .arg("tsx")
+    tsx_command()
+        .current_dir(pkg_dir)
         .arg(ts_file_rel)
         .args(extra)
         .status()
-        .await;
-    match status {
-        Ok(s) => Ok(s),
-        Err(_) => {
-            eprintln!("[test] pnpm exec failed, falling back to npx tsx");
-            let file = workspace_pkg_dir().join(ts_file_rel);
-            let mut all_args: Vec<String> = Vec::with_capacity(1 + extra.len());
-            all_args.push(file.to_string_lossy().to_string());
-            for a in extra {
-                all_args.push((*a).to_string());
-            }
-            Command::new("npx").arg("tsx").args(all_args).status().await
-        }
-    }
+        .await
 }
 
 async fn spawn_tsx_in_pkg(ts_file_rel: &str, extra: &[&str]) -> io::Result<Child> {
-    // Long-running process: try pnpm exec first, else npx
     let pkg_dir = workspace_pkg_dir();
     eprintln!(
-        "[test] spawn_tsx_in_pkg: pnpm exec tsx {ts_file_rel} {}",
+        "[test] spawn_tsx_in_pkg: tsx {ts_file_rel} {}",
         extra.join(" ")
     );
-    let child = Command::new("pnpm")
-        .current_dir(&pkg_dir)
-        .arg("exec")
-        .arg("tsx")
+    tsx_command()
+        .current_dir(pkg_dir)
         .arg(ts_file_rel)
         .args(extra)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .spawn();
-    match child {
-        Ok(c) => Ok(c),
-        Err(_) => {
-            eprintln!("[test] pnpm exec failed, falling back to npx tsx");
-            let file = workspace_pkg_dir().join(ts_file_rel);
-            let mut all_args: Vec<String> = Vec::with_capacity(1 + extra.len());
-            all_args.push(file.to_string_lossy().to_string());
-            for a in extra {
-                all_args.push((*a).to_string());
-            }
-            Command::new("npx")
-                .arg("tsx")
-                .args(all_args)
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .spawn()
-        }
-    }
+        .spawn()
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -91,7 +73,7 @@ async fn js_client_to_rust_client_via_rust_server() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    // Requires pnpm/npx with tsx; runs TS wrappers directly
+    // Uses the workspace-installed tsx binary prepared by the pnpm 10 gate.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let ws_url = format!("ws://127.0.0.1:{}", addr.port());

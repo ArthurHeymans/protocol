@@ -235,7 +235,26 @@ export class EloDoc {
     if (this.verbose) {
       console.info("[ELO] select-backfill", { recordCount: records.length });
     }
-    return [encodeEloContainer(records)];
+    const batches: Uint8Array[] = [];
+    let current: Uint8Array[] = [];
+    let currentPayloadBytes = 0;
+    for (const record of records) {
+      const recordBytes = this.uleb128Length(record.length) + record.length;
+      const candidateBytes =
+        this.uleb128Length(current.length + 1) +
+        currentPayloadBytes +
+        recordBytes;
+      if (current.length > 0 && candidateBytes > 240 * 1024) {
+        batches.push(encodeEloContainer(current));
+        current = [record];
+        currentPayloadBytes = recordBytes;
+      } else {
+        current.push(record);
+        currentPayloadBytes += recordBytes;
+      }
+    }
+    if (current.length > 0) batches.push(encodeEloContainer(current));
+    return batches;
   }
 
   reset(): void {
@@ -347,6 +366,15 @@ export class EloDoc {
       if (difference !== 0) return difference;
     }
     return a.length - b.length;
+  }
+
+  private uleb128Length(value: number): number {
+    let length = 1;
+    while (value >= 128) {
+      value = Math.floor(value / 128);
+      length++;
+    }
+    return length;
   }
 
   private errorMessage(error: unknown): string {

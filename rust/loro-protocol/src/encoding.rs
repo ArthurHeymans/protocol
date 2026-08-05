@@ -274,14 +274,10 @@ pub fn decode(buf: &[u8]) -> Result<ProtocolMessage, String> {
             let mut receiver_version = None;
             let mut app_code = None;
             if matches!(code, JoinErrorCode::VersionUnknown) && r.remaining() > 0 {
-                if let Ok(bytes) = r.read_var_bytes() {
-                    receiver_version = Some(bytes.to_vec());
-                }
+                receiver_version = Some(r.read_var_bytes()?.to_vec());
             }
             if matches!(code, JoinErrorCode::AppError) && r.remaining() > 0 {
-                if let Ok(app) = r.read_var_string() {
-                    app_code = Some(app);
-                }
+                app_code = Some(r.read_var_string()?);
             }
             PM::JoinError {
                 crdt,
@@ -293,7 +289,11 @@ pub fn decode(buf: &[u8]) -> Result<ProtocolMessage, String> {
             }
         }
         MessageType::DocUpdate => {
-            let count = r.read_uleb128()? as usize;
+            let count = usize::try_from(r.read_uleb128()?)
+                .map_err(|_| "Invalid DocUpdate: update count is too large".to_string())?;
+            if count > r.remaining().saturating_sub(8) {
+                return Err("Invalid DocUpdate: update count exceeds remaining data".into());
+            }
             let mut updates = Vec::with_capacity(count);
             for _ in 0..count {
                 updates.push(r.read_var_bytes()?.to_vec());
@@ -385,6 +385,9 @@ pub fn decode(buf: &[u8]) -> Result<ProtocolMessage, String> {
         MessageType::Leave => PM::Leave { crdt, room_id },
     };
 
+    if r.remaining() != 0 {
+        return Err("Protocol message has trailing bytes".into());
+    }
     Ok(msg)
 }
 
@@ -403,9 +406,47 @@ mod tests {
             crdt: CrdtType::Loro,
             room_id: "room-123".to_string(),
         };
-        let enc = encode(&msg).unwrap();
-        let dec = decode(&enc).unwrap();
+        let enc = encode(&msg).expect("Leave must encode");
+        let dec = decode(&enc).expect("encoded Leave must decode");
         assert_eq!(msg, dec);
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes() {
+        let msg = ProtocolMessage::Leave {
+            crdt: CrdtType::Loro,
+            room_id: "room-123".to_string(),
+        };
+        let mut encoded = encode(&msg).expect("Leave must encode");
+        encoded.push(0xff);
+        let error = decode(&encoded).expect_err("trailing bytes must fail");
+        assert!(error.contains("trailing bytes"));
+    }
+
+    #[test]
+    fn decode_rejects_truncated_join_error_extension() {
+        let msg = ProtocolMessage::JoinError {
+            crdt: CrdtType::Loro,
+            room_id: "room-123".to_string(),
+            code: JoinErrorCode::VersionUnknown,
+            message: "retry".to_string(),
+            receiver_version: Some(vec![1, 2]),
+            app_code: None,
+        };
+        let mut encoded = encode(&msg).expect("JoinError must encode");
+        encoded.pop();
+        assert!(decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_impossible_doc_update_count() {
+        let mut encoded = BytesWriter::new();
+        encoded.push_bytes(&CrdtType::Loro.magic_bytes());
+        encoded.push_var_string("room");
+        encoded.push_byte(MessageType::DocUpdate as u8);
+        encoded.push_uleb128(u64::MAX);
+        encoded.push_bytes(&[0; 8]);
+        assert!(decode(&encoded.finalize()).is_err());
     }
 
     #[test]

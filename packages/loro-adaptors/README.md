@@ -66,7 +66,10 @@ const roomPersisted = await client.join({
 });
 
 // %ELO (end‑to‑end encrypted Loro)
-const keyring = new EloKeyring([{ keyId: "k1", key: new Uint8Array(32) }], "k1");
+const keyring = new EloKeyring(
+  [{ keyId: "k1", key: new Uint8Array(32) }],
+  "k1"
+);
 const elo = new EloAdaptor({ keyResolver: keyring });
 // Generate once from at least 16 CSPRNG bytes and share out of band.
 // The relay still sees and can correlate this non-semantic alias.
@@ -130,6 +133,7 @@ The zero-filled keys and literal aliases in snippets are placeholders only; use 
   - `new EloAdaptor(docOrConfig: LoroDoc | { keyResolver?, getPrivateKey?, pendingEncryptedRecords?, onEloError?, ivFactory?, onDecryptError?, onUpdateError? })`
   - `EloKeyResolver` and `EloKeyring` provide exact inbound `keyId` lookup plus active outbound key selection. Key IDs are immutable: `addKey` allows idempotent reinstall but rejects conflicting reuse, and byte keys are defensively copied.
   - `publishSnapshot()` emits a fresh snapshot under the active key after earlier queued writes; `retryPendingEncryptedRecords()` retries the bounded, byte-exact deduplicated unknown-key queue in FIFO order.
+  - New DeltaSpan records use the canonical `varUint count + count × varBytes update` plaintext. Authenticated legacy single-blob records remain importable during migration. A received container is validated on a temporary document before its known-key records mutate the live document.
   - `onEloError` distinguishes `unknown_key`, `decrypt_failed`, malformed/import failures, outbound `encrypt_failed`, and pending eviction. The legacy generic import-error callback is still invoked, but ELO plaintext/ciphertext bytes are redacted from it. A custom `ivFactory` must return a fresh 12-byte IV; repeats are rejected before encryption.
 - `loro-adaptors/flock`
   - `new FlockAdaptor(flock: Flock, config?: { onImportError?, onUpdateError? })`

@@ -49,7 +49,7 @@ fn crdt_magic_includes_elo() {
 fn decode_container_and_parse_delta() {
     let peer = b"peer-a";
     let iv: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-    let ct: Vec<u8> = vec![0xaa, 0xbb, 0xcc, 0xdd];
+    let ct: Vec<u8> = vec![0xaa; 16];
     let rec = make_delta_record(peer, 5, 8, "k1", &iv, &ct);
 
     let container = encode_elo_container([rec.as_slice()]);
@@ -77,7 +77,7 @@ fn parse_snapshot_sorted_vv_and_ct() {
     // Already sorted by peer bytes
     let vv: Vec<(&[u8], u64)> = vec![(b"a", 1), (b"b", 2), (b"zz", 9)];
     let iv: [u8; 12] = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9];
-    let ct: Vec<u8> = vec![0x01, 0x02];
+    let ct: Vec<u8> = vec![0x01; 16];
     let rec = make_snapshot_record(&vv, "kid", &iv, &ct);
     let parsed = parse_elo_record_header(&rec).expect("parse snapshot");
     assert_eq!(parsed.kind, EloRecordKind::Snapshot);
@@ -148,6 +148,19 @@ fn invalid_cases() {
         .unwrap_err()
         .contains("keyId too long"));
 
+    // ciphertext shorter than the mandatory AES-GCM tag
+    let rec = make_delta_record(
+        b"p",
+        1,
+        2,
+        "k",
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        &[1; 15],
+    );
+    assert!(parse_elo_record_header(&rec)
+        .unwrap_err()
+        .contains("shorter than the AES-GCM tag"));
+
     // container trailing bytes
     let mut w = BytesWriter::new();
     w.push_uleb128(1);
@@ -163,7 +176,11 @@ fn invalid_cases() {
     let container = w.finalize();
     assert!(decode_elo_container(&container).is_err());
 
-    // An impossible record count must fail before attempting a huge allocation.
+    // Empty and impossible record counts are invalid containers.
+    let mut w = BytesWriter::new();
+    w.push_uleb128(0);
+    assert!(decode_elo_container(&w.finalize()).is_err());
+
     let mut w = BytesWriter::new();
     w.push_uleb128(u64::MAX);
     assert!(decode_elo_container(&w.finalize()).is_err());

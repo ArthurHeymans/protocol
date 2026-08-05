@@ -60,6 +60,15 @@ const DEFAULT_OUTBOUND_FRAGMENT_SIZE: usize = 240 * 1024;
 const DEFAULT_MAX_WORKSPACES: usize = 1024;
 const DEFAULT_MAX_ROOMS_PER_WORKSPACE: usize = 1024;
 
+fn uleb128_len(mut value: usize) -> usize {
+    let mut length = 1;
+    while value >= 128 {
+        value /= 128;
+        length += 1;
+    }
+    length
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RoomKey {
     crdt: CrdtType,
@@ -443,7 +452,11 @@ impl EloRoomDoc {
                 records.push(&span.record);
             }
         }
-        loro_protocol::elo::encode_elo_container(records)
+        if records.is_empty() {
+            Vec::new()
+        } else {
+            loro_protocol::elo::encode_elo_container(records)
+        }
     }
 
     fn index_updates(&mut self, updates: &[Vec<u8>]) -> Result<(), String> {
@@ -554,11 +567,27 @@ impl CrdtDoc for EloRoomDoc {
                 }
             }
         }
-        if records.is_empty() {
-            Vec::new()
-        } else {
-            vec![loro_protocol::elo::encode_elo_container(records)]
+        const BACKFILL_BATCH_BYTES: usize = 240 * 1024;
+        let mut batches = Vec::new();
+        let mut current = Vec::new();
+        let mut current_payload_bytes = 0usize;
+        for record in records {
+            let record_bytes = uleb128_len(record.len()) + record.len();
+            let candidate_bytes =
+                uleb128_len(current.len() + 1) + current_payload_bytes + record_bytes;
+            if !current.is_empty() && candidate_bytes > BACKFILL_BATCH_BYTES {
+                batches.push(loro_protocol::elo::encode_elo_container(current));
+                current = vec![record];
+                current_payload_bytes = record_bytes;
+            } else {
+                current.push(record);
+                current_payload_bytes += record_bytes;
+            }
         }
+        if !current.is_empty() {
+            batches.push(loro_protocol::elo::encode_elo_container(current));
+        }
+        batches
     }
 
     fn apply_updates(&mut self, updates: &[Vec<u8>]) -> Result<(), String> {
@@ -605,12 +634,14 @@ mod elo_room_doc_tests {
             encode_elo_container([snapshot.as_slice(), covered.as_slice(), later.as_slice()]);
         let mut restored = EloRoomDoc::new();
 
-        restored.import_snapshot(&persisted).unwrap();
+        restored
+            .import_snapshot(&persisted)
+            .expect("persisted ELO state must import");
         assert_eq!(restored.export_persisted_state(), persisted);
         let backfill = restored.compute_backfill(&[]);
         assert_eq!(backfill.len(), 1);
         assert_eq!(
-            decode_elo_container(&backfill[0]).unwrap(),
+            decode_elo_container(&backfill[0]).expect("backfill must decode"),
             vec![snapshot.as_slice(), later.as_slice()]
         );
 
@@ -637,10 +668,11 @@ mod elo_room_doc_tests {
                 opaque_ff.as_slice(),
                 ascii_ff.as_slice(),
             ])])
-            .unwrap();
+            .expect("valid records must apply");
 
         assert_eq!(
-            decode_elo_container(&document.export_persisted_state()).unwrap(),
+            decode_elo_container(&document.export_persisted_state())
+                .expect("persisted records must decode"),
             vec![
                 covering.as_slice(),
                 partial.as_slice(),
@@ -667,7 +699,7 @@ mod elo_room_doc_tests {
         }
         record.push_var_string("key-1");
         record.push_var_bytes(&[marker; 12]);
-        record.push_var_bytes(&[marker]);
+        record.push_var_bytes(&[marker; 16]);
         record.finalize()
     }
 
@@ -679,7 +711,7 @@ mod elo_room_doc_tests {
         record.push_uleb128(end);
         record.push_var_string(key);
         record.push_var_bytes(&[marker; 12]);
-        record.push_var_bytes(&[marker]);
+        record.push_var_bytes(&[marker; 16]);
         record.finalize()
     }
 }

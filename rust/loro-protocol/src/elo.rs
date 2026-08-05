@@ -67,6 +67,9 @@ where
 pub fn decode_elo_container(data: &[u8]) -> Result<Vec<&[u8]>, String> {
     let mut r = BytesReader::new(data);
     let n = usize::try_from(r.read_uleb128()?).map_err(|_| "length too large".to_string())?;
+    if n == 0 {
+        return Err("ELO container must contain at least one record".into());
+    }
     // Every record consumes at least one length-prefix byte. Reject impossible
     // counts before reserving so a tiny corrupt container cannot request a huge
     // allocation.
@@ -123,6 +126,9 @@ fn parse_delta<'a>(
     if key_id.len() > 64 {
         return Err("Invalid ELO delta span: keyId too long".into());
     }
+    if ct.len() < 16 {
+        return Err("Invalid ELO delta span: ciphertext is shorter than the AES-GCM tag".into());
+    }
 
     let mut iv = [0u8; 12];
     iv.copy_from_slice(iv_bytes);
@@ -176,6 +182,9 @@ fn parse_snapshot<'a>(
     // vv must be strictly sorted by peer_id bytes ascending.
     if !is_strictly_sorted_by_bytes(&vv) {
         return Err("Invalid ELO snapshot: vv not strictly sorted by peer id bytes".into());
+    }
+    if ct.len() < 16 {
+        return Err("Invalid ELO snapshot: ciphertext is shorter than the AES-GCM tag".into());
     }
 
     let mut iv = [0u8; 12];

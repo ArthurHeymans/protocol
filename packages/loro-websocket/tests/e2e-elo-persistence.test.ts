@@ -79,10 +79,7 @@ describe("E2E: %ELO persistence", () => {
       disablePing: true,
     });
     await firstClient.waitConnected();
-    const firstKeyring = new EloKeyring(
-      [{ keyId: "key-1", key }],
-      "key-1"
-    );
+    const firstKeyring = new EloKeyring([{ keyId: "key-1", key }], "key-1");
     const firstAdaptor = new EloAdaptor({ keyResolver: firstKeyring });
     const firstRoom = await firstClient.join({
       roomId: "persisted-elo",
@@ -131,7 +128,8 @@ describe("E2E: %ELO persistence", () => {
     const persistedSnapshot = records.find(
       record => parseEloRecordHeader(record).kind === EloRecordKind.Snapshot
     );
-    if (!persistedSnapshot) throw new Error("Expected a persisted ELO snapshot");
+    if (!persistedSnapshot)
+      throw new Error("Expected a persisted ELO snapshot");
     expect(parseEloRecordHeader(persistedSnapshot).keyId).toBe("key-2");
     expect(
       containsSubarray(persisted, new TextEncoder().encode("survives restart"))
@@ -475,10 +473,9 @@ function createProtocolMessageQueue(ws: WebSocket): {
 
 async function nextProtocolMessage(ws: WebSocket): Promise<ProtocolMessage> {
   return await new Promise((resolve, reject) => {
-    const timeout = setTimeout(
-      () => reject(new Error("message timeout")),
-      5_000
-    );
+    const timeout = setTimeout(() => {
+      reject(new Error("message timeout"));
+    }, 5_000);
     ws.once("message", data => {
       clearTimeout(timeout);
       const bytes =

@@ -1,3 +1,7 @@
+use aes_gcm::{
+    aead::{Aead, Payload},
+    Aes256Gcm, KeyInit, Nonce,
+};
 use loro_protocol::{bytes::BytesWriter, elo::*, protocol::CrdtType};
 
 fn hex_to_bytes(s: &str) -> Vec<u8> {
@@ -25,14 +29,14 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 fn normative_vector_deltaspan_header_and_ct_align_with_spec() {
     // From protocol-e2ee.md ## Normative Test Vector (DeltaSpan)
     let key_hex = "0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
-    let _key = hex_to_bytes(key_hex); // not used (no crypto here), kept for clarity
+    let key = hex_to_bytes(key_hex);
     let peer_id = hex_to_bytes("0x01020304");
     let start: u64 = 1;
     let end: u64 = 3;
     let key_id = "k1";
     let iv = hex_to_bytes("0x86bcad09d5e7e3d70503a57e");
     assert_eq!(iv.len(), 12);
-    let _plaintext = hex_to_bytes("0x01026869"); // varUint 1, varBytes("hi")
+    let plaintext = hex_to_bytes("0x01026869"); // varUint 1, varBytes("hi")
 
     // Encode header exactly as spec (this becomes AAD)
     let mut w = BytesWriter::new();
@@ -48,8 +52,21 @@ fn normative_vector_deltaspan_header_and_ct_align_with_spec() {
     let expected_aad = "0x0004010203040103026b310c86bcad09d5e7e3d70503a57e";
     assert_eq!(bytes_to_hex(&header), expected_aad);
 
-    // Ciphertext||tag from spec (AES-GCM over plaintext with key/iv/AAD above)
-    let ct = hex_to_bytes("0x6930a8fbe96cc5f30b67f4bc7f53262e01b62852");
+    // Encrypt the vector instead of copying the expected ciphertext.
+    let cipher = Aes256Gcm::new_from_slice(&key).expect("32-byte AES-256 key");
+    let ct = cipher
+        .encrypt(
+            Nonce::from_slice(&iv),
+            Payload {
+                msg: &plaintext,
+                aad: &header,
+            },
+        )
+        .expect("normative vector encryption");
+    assert_eq!(
+        bytes_to_hex(&ct),
+        "0x6930a8fbe96cc5f30b67f4bc7f53262e01b62852"
+    );
 
     // Build full record = header || varBytes(ct)
     let mut w = BytesWriter::new();

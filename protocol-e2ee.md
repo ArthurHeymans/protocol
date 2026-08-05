@@ -85,6 +85,8 @@ Notes:
 
 - The server MUST be able to parse `kind`, version metadata (`peerId/start/end` for delta or `vv` for snapshot), `iv`, and `keyId` without decrypting `ct`.
 - The CRDT bytes (Loro updates or snapshot encoding) are entirely inside `ct` and only readable by clients with the correct key.
+- DeltaSpan plaintext MUST use `varUint M` followed by exactly `M × varBytes` Loro update blobs and MUST be consumed completely. Implementations MAY temporarily accept an authenticated legacy single raw Loro update blob for migration, but MUST emit only the canonical list encoding.
+- Snapshot plaintext is one genuine Loro snapshot blob; it does not use the DeltaSpan list wrapper.
 - Field bounds: Implementations SHOULD reject records with `peerId` > 64 bytes or `keyId` > 64 UTF‑8 bytes with `Ack.status=invalid_update`. Oversized messages remain subject to the 256 KB limit (`payload_too_large`).
 
 ### AEAD AAD and IV
@@ -118,7 +120,7 @@ The relay does not need the document key and cannot decrypt the CRDT body withou
 - Storage model: `Map<PeerID, Array<Span>>` where each Span is `[start,end)` with associated `keyId` and raw `record` bytes. Spans are kept sorted by `start`.
 - Dedup/merge (Span Override): On receiving a new DeltaSpan for `peerId = P` with span `[S,E)`, replace only if the new span fully covers existing spans for the same `peerId` (i.e., for each covered span `[s,e)`, `S ≤ s` and `E ≥ e`). This replacement is based solely on version metadata and applies regardless of `keyId`.
 - Querying: Given a requester version vector `VV`, send all delta spans where `end > VV[peerId]` (i.e., spans that extend beyond the requester’s counter for that `peerId`).
-- Validation: Servers SHOULD validate header encodings (e.g., `end > start`, for DeltaSpan plaintext, `iv` length == 12, recommended `peerId`/`keyId` bounds) and reject malformed updates with `Ack.status=invalid_update`. Over‑limit payloads SHOULD be rejected with `Ack.status=payload_too_large`.
+- Validation: Servers SHOULD validate header encodings (e.g., `end > start` for DeltaSpan, `iv` length == 12, a ciphertext body of at least the 16-byte GCM tag, and recommended `peerId`/`keyId` bounds) and reject malformed updates with `Ack.status=invalid_update`. Over‑limit payloads SHOULD be rejected with `Ack.status=payload_too_large`.
 - Snapshots and retention: The default relay policy is deliberately simple: retain the latest structurally valid snapshot record plus all non-obsolete indexed delta records. Persistence exports use the standard ELO container with the snapshot first, followed by deterministic peer/span-ordered deltas. For backfill, send a retained snapshot when it advances the requester, then only deltas extending the pointwise maximum of the requester and snapshot version vectors. Receiving a snapshot MUST NOT delete delta coverage. Destructive compaction or snapshot authorization is an explicit application policy and is outside this default.
 
 The server MUST treat `keyId` as opaque metadata and MUST NOT rely on or require any specific format.

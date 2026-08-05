@@ -31,7 +31,7 @@ Use `wss://` in production and prefer a non-semantic base64url or hex room alias
 ## Features
 
 - Handles protocol keepalive (`"ping"/"pong"`) and filters control frames.
-- Automatic fragmentation/reassembly thresholds aligned with the server.
+- Automatic fragmentation/reassembly thresholds aligned with the server. Reassembly is bounded to 64 fragments, 8 MiB per batch, 8 in-flight batches, and 16 MiB of declared in-flight bytes; duplicate/out-of-range fragments and mismatched totals are rejected.
 - %ELO adaptor helpers encrypt/decrypt canonical deltas and genuine snapshots.
 - `EloKeyResolver` is the async application hook; `EloKeyring` selects an active outbound key while retaining historical read keys. `add_key` rejects conflicting key-ID reuse, and resolved key material uses redacted `Debug` output.
 - `join_elo_with_key_resolver` accepts a resolver. Room handles expose FIFO `retry_pending_encrypted_records` and `publish_elo_snapshot`; publication returns `false` if the room is read-only or preparation/encryption fails.

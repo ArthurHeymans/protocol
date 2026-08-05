@@ -41,6 +41,100 @@ export interface ParsedEloRecordHeader {
   aad: Uint8Array; // alias of headerBytes for clarity
 }
 
+export interface EloDeltaPlaintextLimits {
+  maxBlobs?: number;
+  maxBytes?: number;
+}
+
+const DEFAULT_MAX_DELTA_BLOBS = 1024;
+const DEFAULT_MAX_DELTA_PLAINTEXT_BYTES = 8 * 1024 * 1024;
+const AES_GCM_TAG_BYTES = 16;
+
+/** Encode canonical DeltaSpan plaintext: varUint count + count × varBytes blob. */
+export function encodeEloDeltaPlaintext(
+  blobs: readonly Uint8Array[],
+  limits: EloDeltaPlaintextLimits = {}
+): Uint8Array {
+  const { maxBlobs, maxBytes } = resolveDeltaPlaintextLimits(limits);
+  if (blobs.length > maxBlobs) {
+    throw new Error("ELO DeltaSpan blob count exceeds the configured limit");
+  }
+
+  let encodedLength = uleb128Length(blobs.length);
+  if (encodedLength > maxBytes) {
+    throw new Error(
+      "ELO DeltaSpan plaintext exceeds the configured byte limit"
+    );
+  }
+  for (const blob of blobs) {
+    const contribution = uleb128Length(blob.length) + blob.length;
+    if (contribution > maxBytes - encodedLength) {
+      throw new Error(
+        "ELO DeltaSpan plaintext exceeds the configured byte limit"
+      );
+    }
+    encodedLength += contribution;
+  }
+
+  const writer = new BytesWriter();
+  writer.pushUleb128(blobs.length);
+  for (const blob of blobs) writer.pushVarBytes(blob);
+  return writer.finalize();
+}
+
+/** Decode canonical DeltaSpan plaintext and require complete input consumption. */
+export function decodeEloDeltaPlaintext(
+  plaintext: Uint8Array,
+  limits: EloDeltaPlaintextLimits = {}
+): Uint8Array[] {
+  const { maxBlobs, maxBytes } = resolveDeltaPlaintextLimits(limits);
+  if (plaintext.length > maxBytes) {
+    throw new Error(
+      "ELO DeltaSpan plaintext exceeds the configured byte limit"
+    );
+  }
+
+  const reader = new BytesReader(plaintext);
+  const count = reader.readUleb128();
+  if (count > maxBlobs) {
+    throw new Error("ELO DeltaSpan blob count exceeds the configured limit");
+  }
+  const blobs: Uint8Array[] = [];
+  for (let i = 0; i < count; i++) blobs.push(reader.readVarBytes());
+  if (reader.remaining !== 0) {
+    throw new Error("ELO DeltaSpan plaintext has trailing bytes");
+  }
+  return blobs;
+}
+
+function uleb128Length(value: number): number {
+  let length = 1;
+  while (value >= 128) {
+    value = Math.floor(value / 128);
+    length++;
+  }
+  return length;
+}
+
+function resolveDeltaPlaintextLimits(limits: EloDeltaPlaintextLimits): {
+  maxBlobs: number;
+  maxBytes: number;
+} {
+  const maxBlobs = limits.maxBlobs ?? DEFAULT_MAX_DELTA_BLOBS;
+  const maxBytes = limits.maxBytes ?? DEFAULT_MAX_DELTA_PLAINTEXT_BYTES;
+  if (!Number.isSafeInteger(maxBlobs) || maxBlobs < 0) {
+    throw new Error(
+      "ELO DeltaSpan maxBlobs must be a non-negative safe integer"
+    );
+  }
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    throw new Error(
+      "ELO DeltaSpan maxBytes must be a non-negative safe integer"
+    );
+  }
+  return { maxBlobs, maxBytes };
+}
+
 // Container
 export function encodeEloContainer(records: Uint8Array[]): Uint8Array {
   const w = new BytesWriter();
@@ -54,6 +148,9 @@ export function encodeEloContainer(records: Uint8Array[]): Uint8Array {
 export function decodeEloContainer(data: Uint8Array): Uint8Array[] {
   const r = new BytesReader(data);
   const n = r.readUleb128();
+  if (n === 0) {
+    throw new Error("ELO container must contain at least one record");
+  }
   const out: Uint8Array[] = [];
   for (let i = 0; i < n; i++) {
     out.push(r.readVarBytes());
@@ -84,6 +181,23 @@ export function parseEloRecordHeader(
     const headerBytes = recordBytes.slice(0, r.position);
     const ct = r.readVarBytes();
     if (r.remaining !== 0) throw new Error("ELO record trailing bytes");
+    if (endCounter <= startCounter) {
+      throw new Error("Invalid ELO delta span: end must be > start");
+    }
+    if (peerId.length > 64) {
+      throw new Error("Invalid ELO delta span: peerId too long");
+    }
+    if (new TextEncoder().encode(keyId).length > 64) {
+      throw new Error("Invalid ELO delta span: keyId too long");
+    }
+    if (iv.length !== 12) {
+      throw new Error("Invalid ELO delta span: IV must be 12 bytes");
+    }
+    if (ct.length < AES_GCM_TAG_BYTES) {
+      throw new Error(
+        "Invalid ELO delta span: ciphertext is shorter than the AES-GCM tag"
+      );
+    }
     const header: EloDeltaHeader = {
       kind: EloRecordKind.DeltaSpan,
       peerId,
@@ -119,6 +233,29 @@ export function parseEloRecordHeader(
     const headerBytes = recordBytes.slice(0, r.position);
     const ct = r.readVarBytes();
     if (r.remaining !== 0) throw new Error("ELO record trailing bytes");
+    for (const entry of vv) {
+      if (entry.peerId.length > 64) {
+        throw new Error("Invalid ELO snapshot: peerId too long");
+      }
+    }
+    if (new TextEncoder().encode(keyId).length > 64) {
+      throw new Error("Invalid ELO snapshot: keyId too long");
+    }
+    if (iv.length !== 12) {
+      throw new Error("Invalid ELO snapshot: IV must be 12 bytes");
+    }
+    for (let i = 1; i < vv.length; i++) {
+      if (compareBytes(vv[i - 1]!.peerId, vv[i]!.peerId) >= 0) {
+        throw new Error(
+          "Invalid ELO snapshot: vv not strictly sorted by peer id bytes"
+        );
+      }
+    }
+    if (ct.length < AES_GCM_TAG_BYTES) {
+      throw new Error(
+        "Invalid ELO snapshot: ciphertext is shorter than the AES-GCM tag"
+      );
+    }
     const header: EloSnapshotHeader = {
       kind: EloRecordKind.Snapshot,
       vv,
@@ -140,12 +277,16 @@ export function parseEloRecordHeader(
 }
 
 // Crypto helpers (Web Crypto across browsers/Node/CF Workers)
-function getSubtle(): SubtleCrypto {
-  const g = globalThis as unknown as {
-    crypto?: { subtle?: SubtleCrypto };
-  };
-  if (g.crypto && g.crypto.subtle) return g.crypto.subtle;
+function getWebCrypto(): Crypto {
+  const webCrypto = globalThis.crypto;
+  if (webCrypto?.subtle && typeof webCrypto.getRandomValues === "function") {
+    return webCrypto;
+  }
   throw new Error("Web Crypto not available in this environment");
+}
+
+function getSubtle(): SubtleCrypto {
+  return getWebCrypto().subtle;
 }
 
 // Ensure strict DOM BufferSource types without casts by copying into ArrayBuffer
@@ -172,7 +313,7 @@ export async function importAesGcmKey(key: Uint8Array): Promise<CryptoKey> {
 
 export function randomIv12(): Uint8Array {
   const iv = new Uint8Array(12);
-  crypto.getRandomValues(iv);
+  getWebCrypto().getRandomValues(iv);
   return iv;
 }
 
@@ -190,6 +331,7 @@ export async function aesGcmEncrypt(
       name: "AES-GCM",
       iv: toArrayBuffer(iv),
       additionalData: aad ? toArrayBuffer(aad) : undefined,
+      tagLength: 128,
     },
     k,
     toArrayBuffer(plaintext)
@@ -212,6 +354,7 @@ export async function aesGcmDecrypt(
       name: "AES-GCM",
       iv: toArrayBuffer(iv),
       additionalData: aad ? toArrayBuffer(aad) : undefined,
+      tagLength: 128,
     },
     k,
     toArrayBuffer(ct)
@@ -227,6 +370,12 @@ function encodeDeltaHeaderBytes(
   keyId: string,
   iv: Uint8Array
 ): Uint8Array {
+  if (peerId.length > 64)
+    throw new Error("ELO peerId must be at most 64 bytes");
+  if (new TextEncoder().encode(keyId).length > 64) {
+    throw new Error("ELO keyId must be at most 64 UTF-8 bytes");
+  }
+  if (iv.length !== 12) throw new Error("IV must be 12 bytes");
   const w = new BytesWriter();
   w.pushByte(EloRecordKind.DeltaSpan);
   w.pushVarBytes(peerId);
@@ -252,10 +401,31 @@ function encodeSnapshotHeaderBytes(
   keyId: string,
   iv: Uint8Array
 ): Uint8Array {
+  if (vv.length > 1024) {
+    throw new Error(
+      "ELO snapshot version vector must have at most 1024 entries"
+    );
+  }
+  if (new TextEncoder().encode(keyId).length > 64) {
+    throw new Error("ELO keyId must be at most 64 UTF-8 bytes");
+  }
+  if (iv.length !== 12) throw new Error("IV must be 12 bytes");
+  for (const entry of vv) {
+    if (entry.peerId.length > 64) {
+      throw new Error("ELO peerId must be at most 64 bytes");
+    }
+  }
+
   const w = new BytesWriter();
   w.pushByte(EloRecordKind.Snapshot);
-  // Ensure vv is sorted by peerId bytes ascending (lexicographic) as required by the spec
   const vvSorted = [...vv].sort((a, b) => compareBytes(a.peerId, b.peerId));
+  for (let i = 1; i < vvSorted.length; i++) {
+    if (compareBytes(vvSorted[i - 1]!.peerId, vvSorted[i]!.peerId) === 0) {
+      throw new Error(
+        "ELO snapshot version vector contains duplicate peer IDs"
+      );
+    }
+  }
   w.pushUleb128(vvSorted.length);
   for (const { peerId, counter } of vvSorted) {
     w.pushVarBytes(peerId);

@@ -1,19 +1,19 @@
 import { LoroDoc, VersionVector, decodeImportBlobMeta } from "loro-crdt";
-import {
-  CrdtType,
-  type JoinResponseOk,
-} from "loro-protocol";
+import { CrdtType, type JoinResponseOk } from "loro-protocol";
 import type { CrdtAdaptorContext, CrdtDocAdaptor } from "./types";
 import {
   aesGcmDecrypt,
   decodeEloContainer,
+  decodeEloDeltaPlaintext,
   encodeEloContainer,
+  encodeEloDeltaPlaintext,
   encryptDeltaSpan,
   encryptSnapshot,
   EloRecordKind,
   parseEloRecordHeader,
   randomIv12,
   type EloHeader,
+  type ParsedEloRecordHeader,
 } from "loro-protocol";
 
 export type EloKeyMaterial = Parameters<typeof aesGcmDecrypt>[0];
@@ -92,6 +92,15 @@ export interface EloRetryResult {
   remaining: number;
 }
 
+interface DecryptedEloRecord {
+  header: ParsedEloRecordHeader;
+  blobs: Uint8Array[];
+}
+
+type DecryptEloRecordResult =
+  | { status: "decrypted"; value: DecryptedEloRecord }
+  | { status: "unknown" | "failed" };
+
 export interface EloAdaptorConfig {
   /** Compatibility callback. Prefer keyResolver for multi-key applications. */
   getPrivateKey?: (keyId?: string) => Promise<EloResolvedKey | undefined>;
@@ -169,9 +178,12 @@ export class EloAdaptor implements CrdtDocAdaptor {
       reject = rej;
     });
     this.reachServerVersionPromise = { promise, resolve, reject };
-    void this.reachServerVersionPromise.promise.then(() => {
-      this.hasReachedServerVersion = true;
-    });
+    void this.reachServerVersionPromise.promise.then(
+      () => {
+        this.hasReachedServerVersion = true;
+      },
+      () => undefined
+    );
   }
 
   getDoc(): LoroDoc {
@@ -181,8 +193,12 @@ export class EloAdaptor implements CrdtDocAdaptor {
     return this.reachServerVersionPromise.promise;
   }
   cmpVersion(v: Uint8Array): 0 | 1 | -1 | undefined {
-    const vv = VersionVector.decode(v);
-    return this.doc.version().compare(vv) as 0 | 1 | -1 | undefined;
+    try {
+      const vv = VersionVector.decode(v);
+      return this.doc.version().compare(vv) as 0 | 1 | -1 | undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   setCtx(ctx: CrdtAdaptorContext): void {
@@ -220,7 +236,9 @@ export class EloAdaptor implements CrdtDocAdaptor {
     try {
       await this.enqueueOutbound(async () => {
         const serverVersion =
-          res.version.length > 0 ? VersionVector.decode(res.version) : undefined;
+          res.version.length > 0
+            ? VersionVector.decode(res.version)
+            : undefined;
         this.initServerVersion = serverVersion;
 
         const startJson: Record<string, number> = serverVersion
@@ -259,7 +277,7 @@ export class EloAdaptor implements CrdtDocAdaptor {
       this.inboundChain = this.inboundChain.then(async () => {
         if (this.destroyed) return;
         await this.importEloContainer(containerBytes);
-        this.resolveServerVersionAfterImport();
+        if (!this.destroyed) this.resolveServerVersionAfterImport();
       });
       this.inboundChain = this.inboundChain.catch(error => {
         this.reportImportError(asError(error), []);
@@ -295,6 +313,7 @@ export class EloAdaptor implements CrdtDocAdaptor {
       let imported = 0;
       for (const item of pending) {
         const outcome = await this.importEloRecord(item.record, false);
+        if (this.destroyed) return;
         if (outcome === "imported") imported++;
         if (outcome === "unknown") this.enqueuePending(item.record, false);
       }
@@ -330,6 +349,12 @@ export class EloAdaptor implements CrdtDocAdaptor {
     this.ctx = undefined;
     this.pendingRecords.splice(0);
     this.pendingBytes = 0;
+    this.usedIvs.clear();
+    if (!this.hasReachedServerVersion) {
+      this.reachServerVersionPromise.reject(
+        new Error("EloAdaptor destroyed before reaching the server version")
+      );
+    }
   }
 
   private enqueueOutbound<T>(operation: () => Promise<T>): Promise<T> {
@@ -349,7 +374,8 @@ export class EloAdaptor implements CrdtDocAdaptor {
       startVVObj = vvToObject(meta.partialStartVersionVector);
       endVVObj = vvToObject(meta.partialEndVersionVector);
     } catch {
-      // Fall back to exporting the current forward ranges.
+      await this.sendSnapshot();
+      return;
     }
 
     const spans = computeSpansFromVV(
@@ -358,15 +384,17 @@ export class EloAdaptor implements CrdtDocAdaptor {
     );
     if (spans.length === 1) {
       const { keyId, key } = await this.resolveOutboundKey();
-      const span = spans[0]!;
+      const span = spans[0];
+      if (!span) return;
+      const peer = toPeerIdString(span.peer);
       const { record } = await encryptDeltaSpan(
-        updates,
+        encodeEloDeltaPlaintext([updates]),
         {
-          peerId: new TextEncoder().encode(String(span.peer)),
+          peerId: new TextEncoder().encode(peer),
           start: span.start,
           end: span.start + span.length,
           keyId,
-          iv: this.nextIv(),
+          iv: this.nextIv(keyId),
         },
         key
       );
@@ -375,26 +403,25 @@ export class EloAdaptor implements CrdtDocAdaptor {
       return;
     }
 
-    const sent = await this.packageAndSendForwardDeltas(
-      startVVObj,
-      endVVObj
-    );
+    const sent = await this.packageAndSendForwardDeltas(startVVObj, endVVObj);
     if (!sent) await this.sendSnapshot();
   }
 
-  private nextIv(): Uint8Array {
+  private nextIv(keyId: string): Uint8Array {
     const iv = this.config.ivFactory?.() ?? randomIv12();
     if (iv.byteLength !== 12) {
       throw new EloOutboundError("encrypt_failed", "IV must be 12 bytes");
     }
-    const fingerprint = bytesFingerprint(iv);
-    if (this.usedIvs.has(fingerprint)) {
-      throw new EloOutboundError(
-        "encrypt_failed",
-        "ELO IV reuse detected; encryption was not attempted"
-      );
+    if (this.config.ivFactory) {
+      const fingerprint = `${keyId}:${bytesFingerprint(iv)}`;
+      if (this.usedIvs.has(fingerprint)) {
+        throw new EloOutboundError(
+          "encrypt_failed",
+          "ELO IV reuse detected for the same key; encryption was not attempted"
+        );
+      }
+      this.usedIvs.add(fingerprint);
     }
-    this.usedIvs.add(fingerprint);
     return iv;
   }
 
@@ -411,7 +438,7 @@ export class EloAdaptor implements CrdtDocAdaptor {
       }));
     const { record } = await encryptSnapshot(
       plaintext,
-      { vv: vvEntries, keyId, iv: this.nextIv() },
+      { vv: vvEntries, keyId, iv: this.nextIv(keyId) },
       key
     );
     const container = encodeEloContainer([record]);
@@ -447,13 +474,13 @@ export class EloAdaptor implements CrdtDocAdaptor {
         ],
       });
       const { record } = await encryptDeltaSpan(
-        plaintext,
+        encodeEloDeltaPlaintext([plaintext]),
         {
           peerId: peerIdBytes,
           start: startCounter,
           end: endCounter,
           keyId,
-          iv: this.nextIv(),
+          iv: this.nextIv(keyId),
         },
         key
       );
@@ -468,7 +495,9 @@ export class EloAdaptor implements CrdtDocAdaptor {
     return true;
   }
 
-  private async resolveKey(keyId?: string): Promise<EloResolvedKey | undefined> {
+  private async resolveKey(
+    keyId?: string
+  ): Promise<EloResolvedKey | undefined> {
     let resolved: EloResolvedKey | undefined;
     try {
       resolved = this.config.keyResolver
@@ -483,7 +512,11 @@ export class EloAdaptor implements CrdtDocAdaptor {
         error
       );
     }
-    if (resolved !== undefined && keyId !== undefined && resolved.keyId !== keyId) {
+    if (
+      resolved !== undefined &&
+      keyId !== undefined &&
+      resolved.keyId !== keyId
+    ) {
       throw new EloOutboundError(
         "unknown_key",
         `ELO resolver returned key ID ${resolved.keyId} for requested ID ${keyId}`
@@ -513,23 +546,39 @@ export class EloAdaptor implements CrdtDocAdaptor {
       this.reportImportError(asError(error), []);
       return;
     }
+
+    const decrypted: DecryptedEloRecord[] = [];
+    let failed = false;
     for (const record of records) {
-      await this.importEloRecord(record, true);
+      const result = await this.decryptEloRecord(record, true);
+      if (result.status === "decrypted") decrypted.push(result.value);
+      if (result.status === "failed") failed = true;
     }
+    if (failed || decrypted.length === 0) return;
+    this.importDecryptedRecords(decrypted);
   }
 
   private async importEloRecord(
     record: Uint8Array,
     queueUnknown: boolean
   ): Promise<"imported" | "unknown" | "failed"> {
-    let header;
+    const result = await this.decryptEloRecord(record, queueUnknown);
+    if (result.status !== "decrypted") return result.status;
+    return this.importDecryptedRecords([result.value]) ? "imported" : "failed";
+  }
+
+  private async decryptEloRecord(
+    record: Uint8Array,
+    queueUnknown: boolean
+  ): Promise<DecryptEloRecordResult> {
+    let header: ParsedEloRecordHeader;
     try {
       header = parseEloRecordHeader(record);
       validateParsedHeader(header.header);
     } catch (error) {
       this.reportEloError("malformed_record", undefined, asError(error));
       this.reportImportError(asError(error), []);
-      return "failed";
+      return { status: "failed" };
     }
 
     let resolved: EloResolvedKey | undefined;
@@ -539,6 +588,7 @@ export class EloAdaptor implements CrdtDocAdaptor {
     } catch (error) {
       unknownCause = asError(error);
     }
+    if (this.destroyed) return { status: "failed" };
     if (resolved === undefined) {
       const added = queueUnknown ? this.enqueuePending(record, true) : false;
       if (added) {
@@ -548,7 +598,7 @@ export class EloAdaptor implements CrdtDocAdaptor {
           unknownCause ?? new Error(`Unknown ELO key ID: ${header.keyId}`)
         );
       }
-      return "unknown";
+      return { status: "unknown" };
     }
 
     let plaintext: Uint8Array;
@@ -561,16 +611,38 @@ export class EloAdaptor implements CrdtDocAdaptor {
       );
     } catch (error) {
       this.reportEloError("decrypt_failed", header.header, asError(error));
-      return "failed";
+      return { status: "failed" };
     }
+    if (this.destroyed) return { status: "failed" };
 
+    let blobs = [plaintext];
+    if (header.kind === EloRecordKind.DeltaSpan) {
+      try {
+        blobs = decodeEloDeltaPlaintext(plaintext);
+      } catch {
+        // Temporary compatibility path for authenticated pre-canonical records.
+      }
+    }
+    return { status: "decrypted", value: { header, blobs } };
+  }
+
+  private importDecryptedRecords(records: DecryptedEloRecord[]): boolean {
+    if (this.destroyed) return false;
+    const blobs = records.flatMap(record => record.blobs);
+    if (blobs.length === 0) return true;
     try {
-      this.doc.import(plaintext);
-      return "imported";
+      // Validate the whole authenticated container against a temporary clone so
+      // a malformed later record cannot partially mutate the live document.
+      const candidate = new LoroDoc();
+      candidate.import(this.doc.export({ mode: "snapshot" }));
+      candidate.importBatch(blobs);
+      this.doc.importBatch(blobs);
+      return true;
     } catch (error) {
-      this.reportEloError("import_failed", header.header, asError(error));
-      this.reportImportError(asError(error), []);
-      return "failed";
+      const cause = asError(error);
+      this.reportEloError("import_failed", records[0]?.header.header, cause);
+      this.reportImportError(cause, []);
+      return false;
     }
   }
 
@@ -692,7 +764,10 @@ function copyKeyMaterial(key: EloKeyMaterial): EloKeyMaterial {
   return key instanceof Uint8Array ? new Uint8Array(key) : key;
 }
 
-function keyMaterialsEqual(left: EloKeyMaterial, right: EloKeyMaterial): boolean {
+function keyMaterialsEqual(
+  left: EloKeyMaterial,
+  right: EloKeyMaterial
+): boolean {
   if (left instanceof Uint8Array && right instanceof Uint8Array) {
     return bytesEqual(left, right);
   }
@@ -717,7 +792,8 @@ function validateParsedHeader(header: EloHeader): void {
   validateKeyId(header.keyId);
   if (header.iv.byteLength !== 12) throw new Error("ELO IV must be 12 bytes");
   if (header.kind === EloRecordKind.DeltaSpan) {
-    if (header.peerId.byteLength > 64) throw new Error("ELO peer ID is too long");
+    if (header.peerId.byteLength > 64)
+      throw new Error("ELO peer ID is too long");
     if (!(header.end > header.start)) {
       throw new Error("ELO delta span end must be greater than start");
     }
@@ -729,7 +805,7 @@ function validateParsedHeader(header: EloHeader): void {
     }
     for (let index = 1; index < header.vv.length; index++) {
       if (
-        compareBytes(header.vv[index - 1]!.peerId, header.vv[index]!.peerId) >= 0
+        compareBytes(header.vv[index - 1].peerId, header.vv[index].peerId) >= 0
       ) {
         throw new Error("ELO snapshot version vector must be strictly sorted");
       }
@@ -754,7 +830,7 @@ function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
 function compareBytes(left: Uint8Array, right: Uint8Array): number {
   const length = Math.min(left.byteLength, right.byteLength);
   for (let index = 0; index < length; index++) {
-    const difference = left[index]! - right[index]!;
+    const difference = left[index] - right[index];
     if (difference !== 0) return difference;
   }
   return left.byteLength - right.byteLength;

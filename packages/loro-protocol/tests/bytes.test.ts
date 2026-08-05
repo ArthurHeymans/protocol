@@ -40,10 +40,12 @@ describe("BytesWriter/BytesReader", () => {
 
   it("rejects invalid or unrepresentable ULEB128 values", () => {
     const writer = new BytesWriter();
-    expect(() => writer.pushUleb128(-1)).toThrow(/non-negative safe integer/);
-    expect(() => writer.pushUleb128(Number.MAX_SAFE_INTEGER + 1)).toThrow(
-      /non-negative safe integer/
-    );
+    expect(() => {
+      writer.pushUleb128(-1);
+    }).toThrow(/non-negative safe integer/);
+    expect(() => {
+      writer.pushUleb128(Number.MAX_SAFE_INTEGER + 1);
+    }).toThrow(/non-negative safe integer/);
 
     const overflowingU64 = new Uint8Array([
       0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01,
@@ -91,6 +93,18 @@ describe("BytesWriter/BytesReader", () => {
     for (let i = 0; i < values.length; i++) out.push(r.readVarString());
     expect(out).toEqual(values);
     expect(r.remaining).toBe(0);
+  });
+
+  it("rejects malformed UTF-8 varStrings", () => {
+    expect(() =>
+      new BytesReader(new Uint8Array([1, 0xff])).readVarString()
+    ).toThrow();
+  });
+
+  it("rejects invalid fixed byte lengths", () => {
+    const reader = new BytesReader(new Uint8Array([1, 2]));
+    expect(() => reader.readBytes(Number.NaN)).toThrow("out of bounds");
+    expect(() => reader.readBytes(0.5)).toThrow("out of bounds");
   });
 
   it("supports mixed sequence of fields", () => {

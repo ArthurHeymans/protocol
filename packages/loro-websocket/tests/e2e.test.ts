@@ -17,7 +17,7 @@ import {
   type RoomError,
 } from "loro-protocol";
 
-
+const tokenOnceAuth = () => new TextEncoder().encode("token-once");
 
 // Make WebSocket available globally for the client
 Object.defineProperty(globalThis, "WebSocket", {
@@ -430,9 +430,9 @@ describe("E2E: Client-Server Sync", () => {
       await waitUntil(
         () =>
           statuses1.filter(s => s === ClientStatus.Connected).length >
-          initialConnected1 &&
+            initialConnected1 &&
           statuses2.filter(s => s === ClientStatus.Connected).length >
-          initialConnected2,
+            initialConnected2,
         5000,
         25
       );
@@ -467,14 +467,6 @@ describe("E2E: Client-Server Sync", () => {
       unsubscribe2 = client2.onStatusChange(s => statuses2.push(s));
 
       await Promise.all([client1.waitConnected(), client2.waitConnected()]);
-
-      // Keep placeholders to mirror earlier assertions; unused now
-      const _initialConnectedCount1 = statuses1.filter(
-        s => s === ClientStatus.Connected
-      ).length;
-      const _initialConnectedCount2 = statuses2.filter(
-        s => s === ClientStatus.Connected
-      ).length;
 
       const adaptor1 = new LoroAdaptor();
       const adaptor2 = new LoroAdaptor();
@@ -540,11 +532,14 @@ describe("E2E: Client-Server Sync", () => {
     const authPort = await getPort();
     const authServer = new SimpleServer({
       port: authPort,
-      authenticate: async (_roomId, _crdt, _auth) => (allowAuth ? "write" : null),
+      authenticate: async (_roomId, _crdt, _auth) =>
+        allowAuth ? "write" : null,
     });
     await authServer.start();
 
-    const client = new LoroWebsocketClient({ url: `ws://localhost:${authPort}` });
+    const client = new LoroWebsocketClient({
+      url: `ws://localhost:${authPort}`,
+    });
     await client.waitConnected();
     const adaptor = new LoroAdaptor();
     const statuses: string[] = [];
@@ -560,12 +555,7 @@ describe("E2E: Client-Server Sync", () => {
     allowAuth = false;
     await authServer.start();
 
-    await waitUntil(
-      () =>
-        statuses.includes("error"),
-      8000,
-      50
-    );
+    await waitUntil(() => statuses.includes("error"), 8000, 50);
 
     client.destroy();
     await authServer.stop();
@@ -635,10 +625,18 @@ describe("E2E: Client-Server Sync", () => {
     await client.waitConnected();
 
     const adaptor = new LoroAdaptor();
-    const auth = () => new TextEncoder().encode("token-once");
+    const auth = tokenOnceAuth;
 
-    const joinPromise1 = client.join({ roomId: "dedupe", crdtAdaptor: adaptor, auth });
-    const joinPromise2 = client.join({ roomId: "dedupe", crdtAdaptor: adaptor, auth });
+    const joinPromise1 = client.join({
+      roomId: "dedupe",
+      crdtAdaptor: adaptor,
+      auth,
+    });
+    const joinPromise2 = client.join({
+      roomId: "dedupe",
+      crdtAdaptor: adaptor,
+      auth,
+    });
 
     expect(joinPromise1).toBe(joinPromise2);
 
@@ -662,7 +660,7 @@ describe("E2E: Client-Server Sync", () => {
       handlePong: () => void;
     };
     const originalHandlePong = clientWithPong.handlePong;
-    clientWithPong.handlePong = () => { };
+    clientWithPong.handlePong = () => {};
 
     const pingPromise = client.ping(5000);
 
@@ -727,7 +725,9 @@ describe("E2E: Client-Server Sync", () => {
         setTimeout(() => {
           try {
             ws.close(1008, "policy");
-          } catch { }
+          } catch (error) {
+            void error;
+          }
         }, 30);
       }
     });
@@ -840,7 +840,9 @@ describe("E2E: Client-Server Sync", () => {
     const localPort = await getPort();
     const localServer = new SimpleServer({ port: localPort });
     await localServer.start();
-    const client = new LoroWebsocketClient({ url: `ws://localhost:${localPort}` });
+    const client = new LoroWebsocketClient({
+      url: `ws://localhost:${localPort}`,
+    });
     try {
       await client.waitConnected();
       const adaptor = new LoroAdaptor();
@@ -869,7 +871,9 @@ describe("E2E: Client-Server Sync", () => {
     const localPort = await getPort();
     const localServer = new SimpleServer({ port: localPort });
     await localServer.start();
-    const client = new LoroWebsocketClient({ url: `ws://localhost:${localPort}` });
+    const client = new LoroWebsocketClient({
+      url: `ws://localhost:${localPort}`,
+    });
     try {
       await client.waitConnected();
       const adaptor = new LoroAdaptor();
@@ -1062,7 +1066,7 @@ describe("E2E: RoomError rejoin policy", () => {
     const adaptor = new LoroAdaptor();
     await client.join({ roomId: "room-rejoin", crdtAdaptor: adaptor });
 
-    await waitUntil(() => joinCount >= 2, 5000, 20).catch(() => { });
+    await waitUntil(() => joinCount >= 2, 5000, 20).catch(() => {});
     // Ensure no extra rejoins
     await new Promise(r => setTimeout(r, 200));
     expect(joinCount).toBe(2);
@@ -1205,10 +1209,11 @@ function toUint8Array(data: RawData | string): Uint8Array {
     return toUint8Array(Buffer.concat(data as Buffer[]));
   }
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
-  if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  if (ArrayBuffer.isView(data))
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
   // Buffer from ws in Node
-  // @ts-ignore
-  if (typeof Buffer !== "undefined" && Buffer.isBuffer(data)) return new Uint8Array(data);
+  if (typeof Buffer !== "undefined" && Buffer.isBuffer(data))
+    return new Uint8Array(data);
   return new Uint8Array();
 }
 // (duplicate WebSocketServer import removed)

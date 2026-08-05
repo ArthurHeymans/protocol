@@ -45,7 +45,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     hash::{Hash, Hasher},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex as StdMutex,
     },
 };
@@ -88,6 +88,11 @@ impl From<tokio_tungstenite::tungstenite::Error> for ClientError {
 }
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+const MAX_FRAGMENTS_PER_BATCH: usize = 64;
+const MAX_FRAGMENT_BATCH_BYTES: usize = 8 * 1024 * 1024;
+const MAX_INFLIGHT_FRAGMENT_BATCHES: usize = 8;
+const MAX_INFLIGHT_FRAGMENT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Configuration knobs for the high-level client.
 #[derive(Debug, Clone)]
@@ -407,6 +412,75 @@ mod tests {
 
         let updates = collected.lock().await;
         assert_eq!(updates.as_slice(), &[b"helloworld".to_vec()]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fragment_reassembly_rejects_limits_and_duplicates() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let frag_batches = Arc::new(Mutex::new(HashMap::new()));
+        let config = ClientConfig::default();
+        let worker = ConnectionWorker::new(
+            tx,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            frag_batches.clone(),
+            Arc::new(AtomicU64::new(1)),
+            Arc::new(StdMutex::new(HashMap::new())),
+            Arc::new(config),
+        );
+        let batch_id = protocol::BatchId([9; 8]);
+        worker
+            .handle_message(ProtocolMessage::DocUpdateFragmentHeader {
+                crdt: CrdtType::Loro,
+                room_id: "room".into(),
+                batch_id,
+                fragment_count: 65,
+                total_size_bytes: 65,
+            })
+            .await;
+        let Message::Binary(ack) = rx.recv().await.expect("limit ACK") else {
+            panic!("expected binary ACK");
+        };
+        assert!(matches!(
+            try_decode(ack.as_ref()),
+            Some(ProtocolMessage::Ack {
+                status: UpdateStatusCode::PayloadTooLarge,
+                ..
+            })
+        ));
+        assert!(frag_batches.lock().await.is_empty());
+
+        worker
+            .handle_message(ProtocolMessage::DocUpdateFragmentHeader {
+                crdt: CrdtType::Loro,
+                room_id: "room".into(),
+                batch_id,
+                fragment_count: 2,
+                total_size_bytes: 2,
+            })
+            .await;
+        let fragment = ProtocolMessage::DocUpdateFragment {
+            crdt: CrdtType::Loro,
+            room_id: "room".into(),
+            batch_id,
+            index: 0,
+            fragment: vec![1],
+        };
+        worker.handle_message(fragment.clone()).await;
+        worker.handle_message(fragment).await;
+        let Message::Binary(ack) = rx.recv().await.expect("duplicate ACK") else {
+            panic!("expected binary ACK");
+        };
+        assert!(matches!(
+            try_decode(ack.as_ref()),
+            Some(ProtocolMessage::Ack {
+                status: UpdateStatusCode::InvalidUpdate,
+                ..
+            })
+        ));
+        assert!(frag_batches.lock().await.is_empty());
     }
 
     fn require_ok<T, E: std::fmt::Debug>(result: Result<T, E>, context: &str) -> T {
@@ -917,6 +991,57 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn elo_container_import_is_atomic_when_a_later_record_is_malformed() {
+        let source = LoroDoc::new();
+        require_ok(source.set_peer_id(5), "peer id should be configurable");
+        require_ok(
+            source.get_text("text").insert(0, "must stay absent"),
+            "source edit should succeed",
+        );
+        source.commit();
+        let valid_blob = require_ok(
+            source.export(loro::ExportMode::all_updates()),
+            "source update should export",
+        );
+        let key = [4; 32];
+        let valid = encode_test_delta_container(
+            b"5",
+            0,
+            counter_u64(source.oplog_vv()[&5]),
+            "kid",
+            &key,
+            [1; ELO_IV_LENGTH],
+            &valid_blob,
+        );
+        let invalid =
+            encode_test_delta_container(b"6", 0, 1, "kid", &key, [2; ELO_IV_LENGTH], &[0xff]);
+        let valid_records = require_ok(
+            protocol::elo::decode_elo_container(&valid),
+            "valid test container",
+        );
+        let invalid_records = require_ok(
+            protocol::elo::decode_elo_container(&invalid),
+            "invalid-plaintext test container",
+        );
+        let valid_record = valid_records[0].to_vec();
+        let invalid_record = invalid_records[0].to_vec();
+        let container = encode_elo_container(&[valid_record, invalid_record]);
+
+        let destination = Arc::new(Mutex::new(LoroDoc::new()));
+        let errors = Arc::new(StdMutex::new(Vec::new()));
+        let mut adaptor = EloDocAdaptor::new(destination.clone(), "kid", key).with_error_handler({
+            let errors = errors.clone();
+            Arc::new(move |error| lock_unpoisoned(&errors).push(error))
+        });
+        adaptor.apply_update(vec![container]).await;
+
+        assert_eq!(destination.lock().await.get_text("text").to_string(), "");
+        assert!(lock_unpoisoned(&errors)
+            .iter()
+            .any(|error| error.kind == EloAdaptorErrorKind::ImportFailed));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn elo_fixed_key_adaptor_rejects_other_key_ids() {
         let source = LoroDoc::new();
         require_ok(source.set_peer_id(5), "peer id should be configurable");
@@ -1269,6 +1394,25 @@ mod tests {
         assert_eq!(error, EloCryptoError::Encryption);
     }
 
+    #[test]
+    fn elo_iv_reuse_tracking_is_scoped_to_key_material() {
+        let generator: EloIvGenerator = Arc::new(|| Ok([9; ELO_IV_LENGTH]));
+        let used_ivs = Arc::new(StdMutex::new(HashSet::new()));
+        require_ok(
+            encode_elo_snapshot_container_with("k1", &[1; 32], &generator, &used_ivs, b"first"),
+            "first key may use the IV",
+        );
+        require_ok(
+            encode_elo_snapshot_container_with("k2", &[2; 32], &generator, &used_ivs, b"second"),
+            "rotated key may independently use the IV",
+        );
+        assert_eq!(
+            encode_elo_snapshot_container_with("k2", &[2; 32], &generator, &used_ivs, b"repeat",)
+                .expect_err("the same key must not reuse an IV"),
+            EloCryptoError::Encryption
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn elo_randomness_failure_is_reported_without_sending() {
         let doc = Arc::new(Mutex::new(LoroDoc::new()));
@@ -1421,7 +1565,8 @@ impl ConnectionWorker {
                 version,
                 ..
             } => {
-                if let Some(ch) = self.pending.lock().await.remove(&key) {
+                let pending = { self.pending.lock().await.remove(&key) };
+                if let Some(ch) = pending {
                     let _ = ch.send(JoinOutcome::Ok {
                         permission,
                         version,
@@ -1434,7 +1579,8 @@ impl ConnectionWorker {
                 receiver_version,
                 ..
             } => {
-                if let Some(ch) = self.pending.lock().await.remove(&key) {
+                let pending = { self.pending.lock().await.remove(&key) };
+                if let Some(ch) = pending {
                     let _ = ch.send(JoinOutcome::Err {
                         code,
                         message: message.clone(),
@@ -1447,8 +1593,14 @@ impl ConnectionWorker {
                 let adaptor = self.adaptors.lock().await.get(&key).cloned();
                 if let Some(adaptor) = adaptor {
                     adaptor.lock().await.apply_update(updates).await;
-                } else if let Some(state) = self.rooms.lock().await.get(&key) {
-                    let doc = state.doc.lock().await;
+                } else if let Some(doc) = self
+                    .rooms
+                    .lock()
+                    .await
+                    .get(&key)
+                    .map(|state| state.doc.clone())
+                {
+                    let doc = doc.lock().await;
                     for u in updates {
                         let _ = doc.import(&u);
                     }
@@ -1463,29 +1615,69 @@ impl ConnectionWorker {
                 total_size_bytes,
                 ..
             } => {
-                // Insert batch state
+                let declaration = usize::try_from(fragment_count)
+                    .ok()
+                    .zip(usize::try_from(total_size_bytes).ok())
+                    .filter(|(count, total)| {
+                        *count > 0
+                            && *count <= MAX_FRAGMENTS_PER_BATCH
+                            && *total > 0
+                            && *total <= MAX_FRAGMENT_BATCH_BYTES
+                    });
+                let Some((fragment_count, total_size_bytes)) = declaration else {
+                    self.send_fragment_ack(&key, batch_id, UpdateStatusCode::PayloadTooLarge);
+                    return;
+                };
+
                 let mut map = self.frag_batches.lock().await;
+                let batch_key = (key.clone(), batch_id);
+                let existing_bytes = map
+                    .get(&batch_key)
+                    .map(|batch| batch.total_size_bytes)
+                    .unwrap_or(0);
+                let inflight_bytes = map
+                    .values()
+                    .map(|batch| batch.total_size_bytes)
+                    .sum::<usize>();
+                let next_count = map.len() + usize::from(!map.contains_key(&batch_key));
+                let next_bytes = inflight_bytes
+                    .saturating_sub(existing_bytes)
+                    .saturating_add(total_size_bytes);
+                if next_count > MAX_INFLIGHT_FRAGMENT_BATCHES
+                    || next_bytes > MAX_INFLIGHT_FRAGMENT_BYTES
+                {
+                    drop(map);
+                    self.send_fragment_ack(&key, batch_id, UpdateStatusCode::RateLimited);
+                    return;
+                }
+                if let Some(existing) = map.remove(&batch_key) {
+                    existing.timeout_active.store(false, Ordering::Release);
+                }
+                let timeout_active = Arc::new(AtomicBool::new(true));
                 map.insert(
-                    (key.clone(), batch_id),
+                    batch_key.clone(),
                     FragmentBatch {
-                        fragment_count: fragment_count as usize,
-                        total_size_bytes: total_size_bytes as usize,
-                        slots: vec![Vec::new(); fragment_count as usize],
+                        fragment_count,
+                        total_size_bytes,
+                        slots: (0..fragment_count).map(|_| None).collect(),
                         received: 0,
+                        received_bytes: 0,
+                        timeout_active: timeout_active.clone(),
                     },
                 );
                 drop(map);
 
-                // Start a timeout; drop and report FragmentTimeout on expiry.
                 let batches = self.frag_batches.clone();
                 let key_clone = key.clone();
                 let tx_timeout = self.tx.clone();
                 let timeout = self.config.fragment_reassembly_timeout;
                 tokio::spawn(async move {
-                    use tokio::time::sleep;
-                    sleep(timeout).await;
-                    let mut m = batches.lock().await;
-                    if m.remove(&(key_clone.clone(), batch_id)).is_some() {
+                    tokio::time::sleep(timeout).await;
+                    if !timeout_active.swap(false, Ordering::AcqRel) {
+                        return;
+                    }
+                    let mut batches = batches.lock().await;
+                    if batches.remove(&(key_clone.clone(), batch_id)).is_some() {
                         let ack = ProtocolMessage::Ack {
                             crdt: key_clone.crdt,
                             room_id: key_clone.room.clone(),
@@ -1504,36 +1696,79 @@ impl ConnectionWorker {
                 fragment,
                 ..
             } => {
+                let batch_key = (key.clone(), batch_id);
                 let mut map = self.frag_batches.lock().await;
-                if let Some(batch) = map.get_mut(&(key.clone(), batch_id)) {
-                    let i = index as usize;
-                    if i < batch.slots.len() && batch.slots[i].is_empty() {
-                        batch.slots[i] = fragment;
-                        batch.received += 1;
-                    }
-                    if batch.received == batch.fragment_count {
-                        let mut reassembled = Vec::with_capacity(batch.total_size_bytes);
-                        for s in batch.slots.iter() {
-                            reassembled.extend_from_slice(s);
+                let invalid = match map.get_mut(&batch_key) {
+                    Some(batch) => match usize::try_from(index) {
+                        Ok(index)
+                            if index < batch.slots.len()
+                                && batch.slots[index].is_none()
+                                && fragment.len() <= protocol::MAX_MESSAGE_SIZE
+                                && batch
+                                    .received_bytes
+                                    .checked_add(fragment.len())
+                                    .is_some_and(|total| total <= batch.total_size_bytes) =>
+                        {
+                            batch.received_bytes += fragment.len();
+                            batch.slots[index] = Some(fragment);
+                            batch.received += 1;
+                            false
                         }
-                        map.remove(&(key.clone(), batch_id));
+                        _ => true,
+                    },
+                    None => {
                         drop(map);
-                        let adaptor = self.adaptors.lock().await.get(&key).cloned();
-                        if let Some(adaptor) = adaptor {
-                            adaptor.lock().await.apply_update(vec![reassembled]).await;
-                        } else if let Some(state) = self.rooms.lock().await.get(&key) {
-                            let doc = state.doc.lock().await;
-                            let _ = doc.import(&reassembled);
-                        } else {
-                            let mut buf = self.pre_join_buf.lock().await;
-                            buf.entry(key).or_default().push(reassembled);
-                        }
+                        self.send_fragment_ack(&key, batch_id, UpdateStatusCode::FragmentTimeout);
+                        return;
                     }
+                };
+                if invalid {
+                    if let Some(batch) = map.remove(&batch_key) {
+                        batch.timeout_active.store(false, Ordering::Release);
+                    }
+                    drop(map);
+                    self.send_fragment_ack(&key, batch_id, UpdateStatusCode::InvalidUpdate);
+                    return;
+                }
+
+                let complete = map
+                    .get(&batch_key)
+                    .is_some_and(|batch| batch.received == batch.fragment_count);
+                if !complete {
+                    return;
+                }
+                let batch = map.remove(&batch_key).expect("completed batch exists");
+                batch.timeout_active.store(false, Ordering::Release);
+                if batch.received_bytes != batch.total_size_bytes {
+                    drop(map);
+                    self.send_fragment_ack(&key, batch_id, UpdateStatusCode::InvalidUpdate);
+                    return;
+                }
+                let mut reassembled = Vec::with_capacity(batch.total_size_bytes);
+                for slot in batch.slots {
+                    let Some(fragment) = slot else {
+                        drop(map);
+                        self.send_fragment_ack(&key, batch_id, UpdateStatusCode::InvalidUpdate);
+                        return;
+                    };
+                    reassembled.extend_from_slice(&fragment);
+                }
+                drop(map);
+                let adaptor = self.adaptors.lock().await.get(&key).cloned();
+                if let Some(adaptor) = adaptor {
+                    adaptor.lock().await.apply_update(vec![reassembled]).await;
+                } else if let Some(doc) = self
+                    .rooms
+                    .lock()
+                    .await
+                    .get(&key)
+                    .map(|state| state.doc.clone())
+                {
+                    let doc = doc.lock().await;
+                    let _ = doc.import(&reassembled);
                 } else {
-                    eprintln!(
-                        "Received fragment for unknown batch {:?} in room {:?}",
-                        batch_id, key.room
-                    );
+                    let mut buf = self.pre_join_buf.lock().await;
+                    buf.entry(key).or_default().push(reassembled);
                 }
             }
             ProtocolMessage::RoomError { code, message, .. } => {
@@ -1606,6 +1841,23 @@ impl ConnectionWorker {
                 }
             }
             ProtocolMessage::Leave { .. } | ProtocolMessage::JoinRequest { .. } => {}
+        }
+    }
+
+    fn send_fragment_ack(
+        &self,
+        key: &RoomKey,
+        batch_id: protocol::BatchId,
+        status: UpdateStatusCode,
+    ) {
+        let ack = ProtocolMessage::Ack {
+            crdt: key.crdt,
+            room_id: key.room.clone(),
+            ref_id: batch_id,
+            status,
+        };
+        if let Ok(data) = encode(&ack) {
+            let _ = self.tx.send(Message::Binary(data.into()));
         }
     }
 
@@ -2203,8 +2455,10 @@ fn msg_room_id(msg: &ProtocolMessage) -> String {
 struct FragmentBatch {
     fragment_count: usize,
     total_size_bytes: usize,
-    slots: Vec<Vec<u8>>,
+    slots: Vec<Option<Vec<u8>>>,
     received: usize,
+    received_bytes: usize,
+    timeout_active: Arc<AtomicBool>,
 }
 
 // --- Generic CRDT adaptor trait and context ---
@@ -2518,7 +2772,7 @@ fn secure_random_iv() -> Result<[u8; ELO_IV_LENGTH], getrandom::Error> {
     Ok(iv)
 }
 
-type EloUsedIvs = Arc<StdMutex<HashSet<[u8; ELO_IV_LENGTH]>>>;
+type EloUsedIvs = Arc<StdMutex<HashSet<([u8; 32], [u8; ELO_IV_LENGTH])>>>;
 type EloWorkerActivity = Arc<StdMutex<bool>>;
 
 struct EloWorkerFailure {
@@ -2558,18 +2812,21 @@ fn emit_elo_worker_result(
 }
 
 fn next_unique_iv(
+    key: &[u8; 32],
     iv_generator: &EloIvGenerator,
     used_ivs: &EloUsedIvs,
 ) -> Result<[u8; ELO_IV_LENGTH], EloCryptoError> {
-    let iv = iv_generator().map_err(EloCryptoError::Randomness)?;
-    if !used_ivs
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(iv)
-    {
-        return Err(EloCryptoError::Encryption);
+    for _ in 0..4 {
+        let iv = iv_generator().map_err(EloCryptoError::Randomness)?;
+        if used_ivs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((*key, iv))
+        {
+            return Ok(iv);
+        }
     }
-    Ok(iv)
+    Err(EloCryptoError::Encryption)
 }
 
 fn encrypt_elo_record(
@@ -2617,7 +2874,7 @@ fn encode_elo_snapshot_container_with_vv(
 ) -> Result<Vec<u8>, EloCryptoError> {
     use protocol::bytes::BytesWriter;
 
-    let iv = next_unique_iv(iv_generator, used_ivs)?;
+    let iv = next_unique_iv(key, iv_generator, used_ivs)?;
     let mut header = BytesWriter::new();
     header.push_byte(protocol::elo::EloRecordKind::Snapshot as u8);
     header.push_uleb128(vv.len() as u64);
@@ -2720,7 +2977,7 @@ fn encode_elo_delta_container_with(
             )]))
             .map_err(|error| format!("cannot export Loro range {peer}[{start},{end}): {error}"))?;
         let plaintext = encode_canonical_delta_plaintext(&exact_update);
-        let iv = next_unique_iv(iv_generator, used_ivs).map_err(|error| error.to_string())?;
+        let iv = next_unique_iv(key, iv_generator, used_ivs).map_err(|error| error.to_string())?;
         let mut header = BytesWriter::new();
         header.push_byte(protocol::elo::EloRecordKind::DeltaSpan as u8);
         header.push_var_bytes(peer.to_string().as_bytes());
@@ -2895,6 +3152,18 @@ struct PendingEloRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EloImportOutcome {
     Imported,
+    UnknownKey,
+    Failed,
+}
+
+struct DecryptedEloRecord {
+    metadata: EloRecordMetadata,
+    blobs: Vec<Vec<u8>>,
+    source: Vec<u8>,
+}
+
+enum EloDecryptOutcome {
+    Decrypted(DecryptedEloRecord),
     UnknownKey,
     Failed,
 }
@@ -3088,6 +3357,24 @@ impl EloDocAdaptor {
     }
 
     async fn import_elo_record(&mut self, record: &[u8], queue_unknown: bool) -> EloImportOutcome {
+        match self.decrypt_elo_record(record, queue_unknown).await {
+            EloDecryptOutcome::Decrypted(record) => {
+                if self.import_decrypted_records(&[record]).await {
+                    EloImportOutcome::Imported
+                } else {
+                    EloImportOutcome::Failed
+                }
+            }
+            EloDecryptOutcome::UnknownKey => EloImportOutcome::UnknownKey,
+            EloDecryptOutcome::Failed => EloImportOutcome::Failed,
+        }
+    }
+
+    async fn decrypt_elo_record(
+        &mut self,
+        record: &[u8],
+        queue_unknown: bool,
+    ) -> EloDecryptOutcome {
         let parsed = match protocol::elo::parse_elo_record_header(record) {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -3097,7 +3384,7 @@ impl EloDocAdaptor {
                     format!("malformed ELO record: {error}"),
                     vec![record.to_vec()],
                 );
-                return EloImportOutcome::Failed;
+                return EloDecryptOutcome::Failed;
             }
         };
         let metadata = elo_record_metadata(&parsed.header);
@@ -3135,7 +3422,7 @@ impl EloDocAdaptor {
                     vec![record.to_vec()],
                 );
             }
-            return EloImportOutcome::UnknownKey;
+            return EloDecryptOutcome::UnknownKey;
         };
         let iv = match &parsed.header {
             protocol::elo::EloHeader::Delta(header) => header.iv,
@@ -3157,7 +3444,7 @@ impl EloDocAdaptor {
                     "decrypt_failed: ELO authentication failed".to_string(),
                     vec![record.to_vec()],
                 );
-                return EloImportOutcome::Failed;
+                return EloDecryptOutcome::Failed;
             }
         };
         let blobs = if matches!(parsed.kind, protocol::elo::EloRecordKind::DeltaSpan) {
@@ -3165,21 +3452,68 @@ impl EloDocAdaptor {
                 .unwrap_or_else(|_| vec![plaintext.as_slice()])
         } else {
             vec![plaintext.as_slice()]
-        };
-        let doc = self.doc.lock().await;
-        for blob in blobs {
-            if let Err(error) = doc.import(blob) {
-                drop(doc);
-                self.report_error(
-                    EloAdaptorErrorKind::ImportFailed,
-                    Some(metadata),
-                    format!("Loro import failed: {error}"),
-                    vec![record.to_vec()],
-                );
-                return EloImportOutcome::Failed;
-            }
         }
-        EloImportOutcome::Imported
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect();
+        EloDecryptOutcome::Decrypted(DecryptedEloRecord {
+            metadata,
+            blobs,
+            source: record.to_vec(),
+        })
+    }
+
+    async fn import_decrypted_records(&self, records: &[DecryptedEloRecord]) -> bool {
+        let blobs = records
+            .iter()
+            .flat_map(|record| record.blobs.iter().cloned())
+            .collect::<Vec<_>>();
+        if blobs.is_empty() {
+            return true;
+        }
+
+        let current_snapshot = {
+            let doc = self.doc.lock().await;
+            match doc.export(loro::ExportMode::Snapshot) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    drop(doc);
+                    self.report_error(
+                        EloAdaptorErrorKind::ImportFailed,
+                        records.first().map(|record| record.metadata.clone()),
+                        format!("Loro snapshot export failed: {error}"),
+                        records.iter().map(|record| record.source.clone()).collect(),
+                    );
+                    return false;
+                }
+            }
+        };
+        let candidate = LoroDoc::new();
+        let validation = candidate
+            .import(&current_snapshot)
+            .and_then(|_| candidate.import_batch(&blobs));
+        if let Err(error) = validation {
+            self.report_error(
+                EloAdaptorErrorKind::ImportFailed,
+                records.first().map(|record| record.metadata.clone()),
+                format!("Loro import failed: {error}"),
+                records.iter().map(|record| record.source.clone()).collect(),
+            );
+            return false;
+        }
+
+        let doc = self.doc.lock().await;
+        if let Err(error) = doc.import_batch(&blobs) {
+            drop(doc);
+            self.report_error(
+                EloAdaptorErrorKind::ImportFailed,
+                records.first().map(|record| record.metadata.clone()),
+                format!("Loro import failed after validation: {error}"),
+                records.iter().map(|record| record.source.clone()).collect(),
+            );
+            return false;
+        }
+        true
     }
 
     /// Overrides secure IV generation with a deterministic compatibility helper.
@@ -3296,8 +3630,17 @@ impl CrdtDocAdaptor for EloDocAdaptor {
                     continue;
                 }
             };
+            let mut decrypted = Vec::new();
+            let mut failed = false;
             for record in records {
-                self.import_elo_record(&record, true).await;
+                match self.decrypt_elo_record(&record, true).await {
+                    EloDecryptOutcome::Decrypted(record) => decrypted.push(record),
+                    EloDecryptOutcome::UnknownKey => {}
+                    EloDecryptOutcome::Failed => failed = true,
+                }
+            }
+            if !failed {
+                self.import_decrypted_records(&decrypted).await;
             }
         }
     }

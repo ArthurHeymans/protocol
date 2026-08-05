@@ -144,6 +144,8 @@ type ClientStatusValue = typeof ClientStatus[keyof typeof ClientStatus];
 
 - Oversize updates are split into `DocUpdateFragmentHeader` + `DocUpdateFragment` messages and reassembled on the receiver.
 - Fragmentation occurs automatically for single updates that approach the wire limit (headroom reserved under `MAX_MESSAGE_SIZE`). No action is required by callers.
+- Client and server reassembly reject duplicate/out-of-range fragments, mismatched byte totals, and over-limit declarations. Defaults are 64 fragments, 8 MiB per batch, 8 in-flight batches, and 16 MiB of declared in-flight bytes per connection.
+- Client limits are configurable with `maxFragmentsPerBatch`, `maxFragmentBatchBytes`, `maxInflightFragmentBatches`, and `maxInflightFragmentBytes`. `SimpleServer` exposes the corresponding per-connection options plus `fragmentReassemblyTimeoutMs`.
 
 ## SimpleServer (for local/e2e usage)
 

@@ -1,7 +1,7 @@
 use loro_websocket_client::Client;
 use loro_websocket_server as server;
-use loro_websocket_server::protocol::{self as proto, BatchId, CrdtType};
 use loro_websocket_server::protocol::bytes::BytesWriter;
+use loro_websocket_server::protocol::{self as proto, BatchId, CrdtType};
 use std::sync::Arc;
 
 #[tokio::test(flavor = "current_thread")]
@@ -113,7 +113,7 @@ async fn elo_accepts_join_and_broadcasts_updates() {
 }
 
 fn build_minimal_elo_container() -> Vec<u8> {
-    // Record: kind=DeltaSpan, peerId=[1], start=1, end=2, keyId="k1", iv=12 zero bytes, ct=[0]
+    // Record: kind=DeltaSpan, peerId=[1], start=1, end=2, keyId="k1", iv=12 zero bytes, ct=16-byte tag-sized opaque body
     let mut rec = BytesWriter::new();
     rec.push_byte(0x00);
     rec.push_var_bytes(&[1]);
@@ -121,7 +121,7 @@ fn build_minimal_elo_container() -> Vec<u8> {
     rec.push_uleb128(2);
     rec.push_var_string("k1");
     rec.push_var_bytes(&[0u8; 12]);
-    rec.push_var_bytes(&[0]);
+    rec.push_var_bytes(&[0; 16]);
     let rec_bytes = rec.finalize();
 
     // Container with 1 record

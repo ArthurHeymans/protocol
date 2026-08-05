@@ -33,6 +33,16 @@ export interface SimpleServerConfig {
   port: number;
   host?: string; // default 127.0.0.1 to avoid sandbox binding errors
   saveInterval?: number;
+  /** Maximum fragments declared by one batch. Defaults to 64. */
+  maxFragmentsPerBatch?: number;
+  /** Maximum reassembled bytes declared by one batch. Defaults to 8 MiB. */
+  maxFragmentBatchBytes?: number;
+  /** Maximum incomplete batches retained for one connection. Defaults to 8. */
+  maxInflightFragmentBatchesPerConnection?: number;
+  /** Maximum declared bytes retained for one connection. Defaults to 16 MiB. */
+  maxInflightFragmentBytesPerConnection?: number;
+  /** Incomplete fragment lifetime in milliseconds. Defaults to 10 seconds. */
+  fragmentReassemblyTimeoutMs?: number;
   onLoadDocument?: (
     roomId: string,
     crdtType: CrdtType
@@ -67,16 +77,18 @@ interface ClientConnection {
   ws: WebSocket;
   rooms: Set<string>;
   fragments: Map<
-    HexString,
+    string,
     {
-      data: Uint8Array[];
+      data: Array<Uint8Array | undefined>;
       totalSize: number;
       received: number;
+      receivedBytes: number;
       header: DocUpdateFragmentHeader;
       timeoutId?: NodeJS.Timeout;
     }
   >;
   permissions: Map<string, Permission>; // roomKey -> permission
+  messageChain: Promise<void>;
 }
 
 export class SimpleServer {
@@ -90,6 +102,12 @@ export class SimpleServer {
   private stopping = false;
   private config: SimpleServerConfig;
   private static readonly DEFAULT_SAVE_INTERVAL = 60000; // 1 minute
+  private static readonly DEFAULT_MAX_FRAGMENTS_PER_BATCH = 64;
+  private static readonly DEFAULT_MAX_FRAGMENT_BATCH_BYTES = 8 * 1024 * 1024;
+  private static readonly DEFAULT_MAX_INFLIGHT_FRAGMENT_BATCHES = 8;
+  private static readonly DEFAULT_MAX_INFLIGHT_FRAGMENT_BYTES =
+    16 * 1024 * 1024;
+  private static readonly DEFAULT_FRAGMENT_REASSEMBLY_TIMEOUT_MS = 10_000;
 
   constructor(config: SimpleServerConfig) {
     this.config = config;
@@ -101,12 +119,14 @@ export class SimpleServer {
       const options: {
         port: number;
         host?: string;
+        maxPayload: number;
         verifyClient?: (
           info: { origin: string; secure: boolean; req: IncomingMessage },
           cb: (res: boolean, code?: number, message?: string) => void
         ) => void;
       } = {
         port: this.config.port,
+        maxPayload: MAX_MESSAGE_SIZE,
       };
       if (this.config.host) {
         options.host = this.config.host;
@@ -135,6 +155,7 @@ export class SimpleServer {
           rooms: new Set(),
           fragments: new Map(),
           permissions: new Map(),
+          messageChain: Promise.resolve(),
         };
         this.clients.set(ws, client);
 
@@ -156,14 +177,7 @@ export class SimpleServer {
             }
 
             const message = decode(bytes);
-            const handling = this.handleMessage(client, message);
-            this.inFlightMessages.add(handling);
-            void handling
-              .catch(error => {
-                console.error("Failed to handle message:", error);
-                ws.close(1002, "Protocol error");
-              })
-              .finally(() => this.inFlightMessages.delete(handling));
+            this.enqueueMessage(client, message);
           } catch (error) {
             console.error("Failed to decode message:", error);
             ws.close(1002, "Protocol error");
@@ -204,12 +218,14 @@ export class SimpleServer {
     // Closing clients prevents new work; awaiting accepted handlers prevents an
     // already-started update or load from racing the final save.
     await Promise.allSettled(this.inFlightMessages);
-    await this.saveAllDirtyDocuments();
+    await this.saveAllDirtyDocuments(true);
 
     if (!wss) return;
     await new Promise<void>(resolve => {
       try {
-        wss.close(() => resolve());
+        wss.close(() => {
+          resolve();
+        });
       } catch {
         resolve();
       }
@@ -291,6 +307,23 @@ export class SimpleServer {
       return out;
     }
     throw new Error("Unsupported message data type");
+  }
+
+  private enqueueMessage(
+    client: ClientConnection,
+    message: ProtocolMessage
+  ): void {
+    const handling = client.messageChain.then(() =>
+      this.handleMessage(client, message)
+    );
+    this.inFlightMessages.add(handling);
+    client.messageChain = handling.catch(error => {
+      console.error("Failed to handle message:", error);
+      client.ws.close(1002, "Protocol error");
+    });
+    void client.messageChain.finally(() => {
+      this.inFlightMessages.delete(handling);
+    });
   }
 
   private async handleMessage(
@@ -443,7 +476,6 @@ export class SimpleServer {
           message.crdt,
           message.roomId
         );
-        client.fragments.delete(message.batchId);
         return;
       }
 
@@ -526,8 +558,7 @@ export class SimpleServer {
     message: DocUpdateFragmentHeader
   ): void {
     const roomKey = this.getRoomKey(message.roomId, message.crdt);
-
-    // Check if client has joined this room
+    const fragmentKey = this.getFragmentKey(message);
     if (!client.rooms.has(roomKey)) {
       this.sendAck(
         client.ws,
@@ -539,19 +570,71 @@ export class SimpleServer {
       return;
     }
 
+    const maxFragments =
+      this.config.maxFragmentsPerBatch ??
+      SimpleServer.DEFAULT_MAX_FRAGMENTS_PER_BATCH;
+    const maxBatchBytes =
+      this.config.maxFragmentBatchBytes ??
+      SimpleServer.DEFAULT_MAX_FRAGMENT_BATCH_BYTES;
+    const maxBatches =
+      this.config.maxInflightFragmentBatchesPerConnection ??
+      SimpleServer.DEFAULT_MAX_INFLIGHT_FRAGMENT_BATCHES;
+    const maxInflightBytes =
+      this.config.maxInflightFragmentBytesPerConnection ??
+      SimpleServer.DEFAULT_MAX_INFLIGHT_FRAGMENT_BYTES;
+    const validDeclaration =
+      Number.isSafeInteger(message.fragmentCount) &&
+      message.fragmentCount > 0 &&
+      message.fragmentCount <= maxFragments &&
+      Number.isSafeInteger(message.totalSizeBytes) &&
+      message.totalSizeBytes > 0 &&
+      message.totalSizeBytes <= maxBatchBytes;
+    if (!validDeclaration) {
+      this.sendAck(
+        client.ws,
+        message.batchId,
+        UpdateStatusCode.PayloadTooLarge,
+        message.crdt,
+        message.roomId
+      );
+      return;
+    }
+
+    const existing = client.fragments.get(fragmentKey);
+    const existingBytes = existing?.totalSize ?? 0;
+    const inflightBytes = Array.from(client.fragments.values()).reduce(
+      (total, batch) => total + batch.totalSize,
+      0
+    );
+    const nextBatchCount = client.fragments.size + (existing ? 0 : 1);
+    if (
+      nextBatchCount > maxBatches ||
+      inflightBytes - existingBytes + message.totalSizeBytes > maxInflightBytes
+    ) {
+      this.sendAck(
+        client.ws,
+        message.batchId,
+        UpdateStatusCode.RateLimited,
+        message.crdt,
+        message.roomId
+      );
+      return;
+    }
+    if (existing?.timeoutId) clearTimeout(existing.timeoutId);
+
     const batch = {
       data: Array.from(
         { length: message.fragmentCount },
-        () => new Uint8Array()
+        (): Uint8Array | undefined => undefined
       ),
       totalSize: message.totalSizeBytes,
       received: 0,
+      receivedBytes: 0,
       header: message,
       timeoutId: undefined as NodeJS.Timeout | undefined,
     };
-
     batch.timeoutId = setTimeout(() => {
-      client.fragments.delete(message.batchId);
+      client.fragments.delete(fragmentKey);
       this.sendAck(
         client.ws,
         message.batchId,
@@ -559,16 +642,16 @@ export class SimpleServer {
         message.crdt,
         message.roomId
       );
-    }, 10000);
-
-    client.fragments.set(message.batchId, batch);
+    }, this.config.fragmentReassemblyTimeoutMs ?? SimpleServer.DEFAULT_FRAGMENT_REASSEMBLY_TIMEOUT_MS);
+    client.fragments.set(fragmentKey, batch);
   }
 
   private async handleFragment(
     client: ClientConnection,
     message: DocUpdateFragment
   ): Promise<void> {
-    const batch = client.fragments.get(message.batchId);
+    const fragmentKey = this.getFragmentKey(message);
+    const batch = client.fragments.get(fragmentKey);
     if (!batch) {
       this.sendAck(
         client.ws,
@@ -580,17 +663,53 @@ export class SimpleServer {
       return;
     }
 
+    if (
+      message.roomId !== batch.header.roomId ||
+      message.crdt !== batch.header.crdt ||
+      !Number.isSafeInteger(message.index) ||
+      message.index < 0 ||
+      message.index >= batch.data.length ||
+      message.fragment.length > MAX_MESSAGE_SIZE ||
+      batch.data[message.index] !== undefined ||
+      batch.receivedBytes + message.fragment.length > batch.totalSize
+    ) {
+      if (batch.timeoutId) clearTimeout(batch.timeoutId);
+      client.fragments.delete(fragmentKey);
+      this.sendAck(
+        client.ws,
+        message.batchId,
+        UpdateStatusCode.InvalidUpdate,
+        message.crdt,
+        message.roomId
+      );
+      return;
+    }
+
     batch.data[message.index] = message.fragment;
     batch.received++;
+    batch.receivedBytes += message.fragment.length;
 
-    // Check if all fragments received
     if (batch.received === batch.data.length) {
       if (batch.timeoutId) clearTimeout(batch.timeoutId);
-      // Reconstruct the complete update
+      if (batch.receivedBytes !== batch.totalSize) {
+        client.fragments.delete(fragmentKey);
+        this.sendAck(
+          client.ws,
+          message.batchId,
+          UpdateStatusCode.InvalidUpdate,
+          message.crdt,
+          message.roomId
+        );
+        return;
+      }
       const totalData = new Uint8Array(batch.totalSize);
       let offset = 0;
 
       for (const fragment of batch.data) {
+        if (!fragment) {
+          client.fragments.delete(fragmentKey);
+          return;
+        }
         totalData.set(fragment, offset);
         offset += fragment.length;
       }
@@ -607,6 +726,7 @@ export class SimpleServer {
           message.crdt,
           message.roomId
         );
+        client.fragments.delete(fragmentKey);
         return;
       }
 
@@ -619,7 +739,7 @@ export class SimpleServer {
           message.crdt,
           message.roomId
         );
-        client.fragments.delete(message.batchId);
+        client.fragments.delete(fragmentKey);
         return;
       }
 
@@ -643,7 +763,7 @@ export class SimpleServer {
           message.crdt,
           message.roomId
         );
-        client.fragments.delete(message.batchId);
+        client.fragments.delete(fragmentKey);
         return;
       }
       if (roomDoc.descriptor.shouldPersist) {
@@ -661,7 +781,7 @@ export class SimpleServer {
       );
 
       // Broadcast original fragments to other clients in the room
-      const header = client.fragments.get(message.batchId)!.header;
+      const header = client.fragments.get(fragmentKey)!.header;
       this.wss?.clients.forEach(ws => {
         const c = this.clients.get(ws);
         if (!c || c === client) return;
@@ -680,8 +800,16 @@ export class SimpleServer {
         }
       });
 
-      client.fragments.delete(message.batchId);
+      client.fragments.delete(fragmentKey);
     }
+  }
+
+  private getFragmentKey(message: {
+    crdt: CrdtType;
+    roomId: RoomId;
+    batchId: HexString;
+  }): string {
+    return `${message.crdt}:${message.roomId}:${message.batchId}`;
   }
 
   private handleLeave(client: ClientConnection, message: Leave): void {
@@ -887,17 +1015,20 @@ export class SimpleServer {
     return { roomId, crdtType };
   }
 
-  private saveAllDirtyDocuments(): Promise<void> {
+  private saveAllDirtyDocuments(propagateErrors = false): Promise<void> {
     const queuedSave = this.saveChain.then(() =>
-      this.saveAllDirtyDocumentsOnce()
+      this.saveAllDirtyDocumentsOnce(propagateErrors)
     );
     this.saveChain = queuedSave.catch(() => {});
     return queuedSave;
   }
 
-  private async saveAllDirtyDocumentsOnce(): Promise<void> {
+  private async saveAllDirtyDocumentsOnce(
+    propagateErrors: boolean
+  ): Promise<void> {
     if (!this.config.onSaveDocument) return;
 
+    const errors: unknown[] = [];
     for (const [roomKey, roomDoc] of this.rooms) {
       if (!roomDoc.dirty || !roomDoc.descriptor.shouldPersist) continue;
       const generation = roomDoc.generation;
@@ -911,7 +1042,11 @@ export class SimpleServer {
         roomDoc.lastSaved = Date.now();
       } catch (error) {
         console.error("Failed to save document:", error);
+        errors.push(error);
       }
+    }
+    if (propagateErrors && errors.length > 0) {
+      throw errors[0];
     }
   }
 }

@@ -378,7 +378,7 @@ fn snapshot_record(peer: &[u8], counter: u64, marker: u8) -> Vec<u8> {
     record.push_uleb128(counter);
     record.push_var_string("key-1");
     record.push_var_bytes(&[marker; 12]);
-    record.push_var_bytes(&[marker]);
+    record.push_var_bytes(&[marker; 16]);
     record.finalize()
 }
 
@@ -390,6 +390,6 @@ fn delta_record(peer: &[u8], start: u64, end: u64, marker: u8) -> Vec<u8> {
     record.push_uleb128(end);
     record.push_var_string("key-1");
     record.push_var_bytes(&[marker; 12]);
-    record.push_var_bytes(&[marker]);
+    record.push_var_bytes(&[marker; 16]);
     record.finalize()
 }
