@@ -1141,6 +1141,104 @@ mod tests {
             .any(|error| error.kind == EloAdaptorErrorKind::ImportFailed));
     }
 
+    #[derive(Default)]
+    struct RecordingEloMaterializer {
+        updates: Arc<Mutex<Vec<Vec<u8>>>>,
+        error: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl EloUpdateMaterializer for RecordingEloMaterializer {
+        async fn materialize(
+            &self,
+            _doc: Arc<Mutex<LoroDoc>>,
+            updates: Vec<Vec<u8>>,
+        ) -> Result<(), String> {
+            self.updates.lock().await.extend(updates);
+            match &self.error {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn elo_custom_materializer_owns_plaintext_application() {
+        let source = LoroDoc::new();
+        require_ok(source.set_peer_id(5), "peer id should be configurable");
+        require_ok(
+            source.get_text("text").insert(0, "validated externally"),
+            "source edit should succeed",
+        );
+        source.commit();
+        let blob = require_ok(
+            source.export(loro::ExportMode::all_updates()),
+            "source update should export",
+        );
+        let key = [4; 32];
+        let container = encode_test_delta_container(
+            b"5",
+            0,
+            counter_u64(source.oplog_vv()[&5]),
+            "kid",
+            &key,
+            [1; ELO_IV_LENGTH],
+            &blob,
+        );
+
+        let destination = Arc::new(Mutex::new(LoroDoc::new()));
+        let materializer = Arc::new(RecordingEloMaterializer::default());
+        let mut adaptor = EloDocAdaptor::new(destination.clone(), "kid", key)
+            .with_update_materializer(materializer.clone());
+        adaptor.apply_update(vec![container]).await;
+
+        assert_eq!(materializer.updates.lock().await.as_slice(), &[blob]);
+        assert_eq!(destination.lock().await.get_text("text").to_string(), "");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn elo_materializer_rejection_is_an_import_failure() {
+        let source = LoroDoc::new();
+        require_ok(source.set_peer_id(5), "peer id should be configurable");
+        require_ok(
+            source.get_text("text").insert(0, "invalid org schema"),
+            "source edit should succeed",
+        );
+        source.commit();
+        let blob = require_ok(
+            source.export(loro::ExportMode::all_updates()),
+            "source update should export",
+        );
+        let key = [4; 32];
+        let container = encode_test_delta_container(
+            b"5",
+            0,
+            counter_u64(source.oplog_vv()[&5]),
+            "kid",
+            &key,
+            [1; ELO_IV_LENGTH],
+            &blob,
+        );
+
+        let errors = Arc::new(StdMutex::new(Vec::new()));
+        let materializer = Arc::new(RecordingEloMaterializer {
+            updates: Arc::default(),
+            error: Some("invalid remote Org schema".to_string()),
+        });
+        let mut adaptor = EloDocAdaptor::new(Arc::new(Mutex::new(LoroDoc::new())), "kid", key)
+            .with_update_materializer(materializer)
+            .with_error_handler({
+                let errors = errors.clone();
+                Arc::new(move |error| lock_unpoisoned(&errors).push(error))
+            });
+        adaptor.apply_update(vec![container]).await;
+
+        assert!(lock_unpoisoned(&errors).iter().any(|error| {
+            error.kind == EloAdaptorErrorKind::ImportFailed
+                && error.message == "invalid remote Org schema"
+        }));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn elo_fixed_key_adaptor_rejects_other_key_ids() {
         let source = LoroDoc::new();
@@ -3328,6 +3426,51 @@ fn elo_record_metadata(header: &protocol::elo::EloHeader) -> EloRecordMetadata {
     }
 }
 
+/// Application-owned materialization of authenticated ELO plaintext updates.
+///
+/// Implementations may validate an application schema, reconcile durable state,
+/// and then update `doc`. Returning an error rejects the decrypted batch without
+/// the adaptor directly importing it.
+#[async_trait::async_trait]
+pub trait EloUpdateMaterializer: Send + Sync {
+    async fn materialize(
+        &self,
+        doc: Arc<Mutex<LoroDoc>>,
+        updates: Vec<Vec<u8>>,
+    ) -> Result<(), String>;
+}
+
+struct DirectEloUpdateMaterializer;
+
+#[async_trait::async_trait]
+impl EloUpdateMaterializer for DirectEloUpdateMaterializer {
+    async fn materialize(
+        &self,
+        doc: Arc<Mutex<LoroDoc>>,
+        updates: Vec<Vec<u8>>,
+    ) -> Result<(), String> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let current_snapshot = doc
+            .lock()
+            .await
+            .export(loro::ExportMode::Snapshot)
+            .map_err(|error| format!("Loro snapshot export failed: {error}"))?;
+        let candidate = LoroDoc::new();
+        candidate
+            .import(&current_snapshot)
+            .and_then(|_| candidate.import_batch(&updates))
+            .map_err(|error| format!("Loro import failed: {error}"))?;
+        doc.lock()
+            .await
+            .import_batch(&updates)
+            .map_err(|error| format!("Loro import failed after validation: {error}"))?;
+        Ok(())
+    }
+}
+
 /// Experimental %ELO adaptor with application key resolution and retryable imports.
 pub struct EloDocAdaptor {
     doc: Arc<Mutex<LoroDoc>>,
@@ -3341,6 +3484,7 @@ pub struct EloDocAdaptor {
     pending_records: VecDeque<PendingEloRecord>,
     pending_bytes: usize,
     error_handler: Arc<dyn Fn(EloAdaptorError) + Send + Sync>,
+    update_materializer: Arc<dyn EloUpdateMaterializer>,
     worker_active: EloWorkerActivity,
     worker_tx: Option<mpsc::UnboundedSender<EloWorkerCommand>>,
     worker: Option<tokio::task::JoinHandle<()>>,
@@ -3382,6 +3526,7 @@ impl EloDocAdaptor {
             pending_records: VecDeque::new(),
             pending_bytes: 0,
             error_handler: Arc::new(|_| {}),
+            update_materializer: Arc::new(DirectEloUpdateMaterializer),
             worker_active: Arc::new(StdMutex::new(false)),
             worker_tx: None,
             worker: None,
@@ -3399,6 +3544,16 @@ impl EloDocAdaptor {
         handler: Arc<dyn Fn(EloAdaptorError) + Send + Sync>,
     ) -> Self {
         self.error_handler = handler;
+        self
+    }
+
+    /// Delegate authenticated plaintext updates to application-owned validation
+    /// and materialization instead of importing them directly into the Loro doc.
+    pub fn with_update_materializer(
+        mut self,
+        materializer: Arc<dyn EloUpdateMaterializer>,
+    ) -> Self {
+        self.update_materializer = materializer;
         self
     }
 
@@ -3613,43 +3768,15 @@ impl EloDocAdaptor {
             return true;
         }
 
-        let current_snapshot = {
-            let doc = self.doc.lock().await;
-            match doc.export(loro::ExportMode::Snapshot) {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    drop(doc);
-                    self.report_error(
-                        EloAdaptorErrorKind::ImportFailed,
-                        records.first().map(|record| record.metadata.clone()),
-                        format!("Loro snapshot export failed: {error}"),
-                        records.iter().map(|record| record.source.clone()).collect(),
-                    );
-                    return false;
-                }
-            }
-        };
-        let candidate = LoroDoc::new();
-        let validation = candidate
-            .import(&current_snapshot)
-            .and_then(|_| candidate.import_batch(&blobs));
-        if let Err(error) = validation {
+        if let Err(error) = self
+            .update_materializer
+            .materialize(self.doc.clone(), blobs)
+            .await
+        {
             self.report_error(
                 EloAdaptorErrorKind::ImportFailed,
                 records.first().map(|record| record.metadata.clone()),
-                format!("Loro import failed: {error}"),
-                records.iter().map(|record| record.source.clone()).collect(),
-            );
-            return false;
-        }
-
-        let doc = self.doc.lock().await;
-        if let Err(error) = doc.import_batch(&blobs) {
-            drop(doc);
-            self.report_error(
-                EloAdaptorErrorKind::ImportFailed,
-                records.first().map(|record| record.metadata.clone()),
-                format!("Loro import failed after validation: {error}"),
+                error,
                 records.iter().map(|record| record.source.clone()).collect(),
             );
             return false;
