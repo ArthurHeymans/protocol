@@ -5,7 +5,7 @@ Async WebSocket client for the Loro protocol. Exposes:
 - Low-level `Client` to send/receive raw `loro_protocol::ProtocolMessage`.
 - High-level `LoroWebsocketClient` that joins rooms and mirrors updates into a `loro::LoroDoc`, matching the TypeScript client behavior.
 
-%ELO support includes canonical delta packaging, application key resolution, rotation, bounded unknown-key retry, and genuine snapshot bootstrap. Key distribution/KMS remains application-owned.
+%ELO support includes canonical delta packaging, application key resolution, rotation, bounded unknown-key retry, and genuine snapshot bootstrap. Key distribution/KMS remains application-owned. ELO encrypts document bodies only: room IDs and plaintext routing headers remain visible to the relay and any TLS terminator.
 
 ## Quick start
 
@@ -23,6 +23,10 @@ let _room = client.join_loro("room1", doc.clone()).await?;
 { let mut d = doc.lock().await; d.get_text("text").insert(0, "hello")?; d.commit(); }
 # Ok(()) }
 ```
+
+## ELO privacy boundary
+
+Use `wss://` in production and prefer a non-semantic base64url or hex room alias generated from at least 16 bytes from an OS CSPRNG. Generate it once and share it through an authenticated, confidential application channel. TLS protects the path to its endpoint, not protocol fields from the endpoint or relay. The server still receives the exact alias and can correlate it, so it is not a credential or a substitute for join authentication/authorization. ELO record kind; raw peer IDs and delta `start`/`end` counters or snapshot peer/counter version-vector entries; `keyId`; IV; container sizes; traffic timing; and membership activity are also observable. Use non-sensitive `keyId` labels; IVs are public but must be unique per key.
 
 ## Features
 

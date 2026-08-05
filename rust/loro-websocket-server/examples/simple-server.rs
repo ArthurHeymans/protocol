@@ -7,6 +7,9 @@
 //! Notes:
 //! - Uses a single-thread Tokio runtime to match crate features.
 //! - Defaults to 127.0.0.1:9000 and ./loro.db if not specified.
+//! - Room IDs are visible to the relay/TLS terminator and are stored as SQLite
+//!   keys. For production, prefer non-semantic aliases generated from at least
+//!   16 bytes from an OS CSPRNG; aliases remain visible and are not authorization.
 
 use clap::Parser;
 use std::{error::Error, path::PathBuf};

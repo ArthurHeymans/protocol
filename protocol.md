@@ -38,6 +38,14 @@ for another client to resend their presence data.
 
 Note: Keepalive frames are special and bypass this envelope entirely. When the entire frame payload is exactly the text string "ping" or "pong" (WebSocket text frames), it MUST be treated as a keepalive and NOT parsed using the fields above. See Keepalive: Ping/Pong.
 
+## Room IDs and transport privacy
+
+The room ID is a cleartext routing field in every protocol envelope. The receiver (for example, a relay server) necessarily reads the exact value. An authenticated, encrypted transport protects protocol frames only on the path between its endpoints. For WebSockets, use `wss://`; the TLS endpoint that terminates the connection can read the envelope, and a separate unencrypted hop from a TLS proxy to the relay would expose it on that hop. Without transport encryption, on-path observers can also read room IDs and other envelope metadata.
+
+Applications SHOULD use non-semantic, opaque room aliases generated from at least 128 random bits from a CSPRNG and encode them as base64url or hex. Generate an alias once and share it through an authenticated, confidential application channel. Do not put project names, user names, email addresses, or other sensitive labels in room IDs.
+
+Here, *opaque* means that the alias carries no application meaning. It does not hide the alias from the server, prevent the server from correlating activity in that room, or conceal traffic timing, sizes, membership, or CRDT type. A room alias is also not a credential: servers MUST authenticate and authorize joins independently. `%ELO` encrypts document bodies but intentionally retains the clear envelope and additional plaintext routing headers described in `protocol-e2ee.md`.
+
 ## Terminology
 
 - Req (Requester): the client side of a WebSocket connection.

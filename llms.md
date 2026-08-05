@@ -20,13 +20,27 @@ end-to-end encrypted extension, and the full surface of the
   - `%YAW` – Yjs awareness.
   - `%ELO` – Encrypted Loro document updates (see §3).
 - **Envelope fields (after magic bytes):**
-  1. `varBytes roomId` (max 128 bytes).
+  1. `varString roomId` (max 128 UTF-8 bytes).
   2. `u8 messageType`.
   3. Type-specific payload.
 - **Message size ceiling:** 256 KiB. Larger payloads must be fragmented with
   `DocUpdateFragmentHeader` + `DocUpdateFragment`.
 - **Keepalive:** Plain-text `"ping"`/`"pong"` WebSocket frames bypass the
   envelope; they are connection-scoped and never forwarded to rooms.
+
+### Room and transport privacy
+
+Room IDs are cleartext routing fields. The relay and any TLS terminator receive
+the exact value. TLS protects the path between its peers, but it does not hide
+the protocol envelope from the endpoint that terminates TLS or from the relay
+that processes it.
+
+For production rooms, prefer non-semantic base64url or hex aliases generated
+from at least 128 random bits from a CSPRNG and shared through an authenticated,
+confidential application channel. "Opaque" means the alias has no application
+meaning; it does not hide the identifier from the server, stop server-side
+correlation, or make the alias a credential. Authenticate and authorize joins
+separately.
 
 ### 1.1 Message Types
 
@@ -138,7 +152,7 @@ Each `recordBytes` contains a plaintext header followed by AES-GCM ciphertext
   - `varBytes iv` (12-byte).
   - `varBytes ct`.
 
-The server parses headers for routing/deduplication but never decrypts `ct`.
+A relay without the document key cannot decrypt `ct`, but it parses the plaintext headers for routing/deduplication. The relay and any TLS terminator can read the record kind; raw peer IDs and delta `start`/`end` counters or snapshot peer/counter version-vector entries; `keyId`; IV; and container lengths. Room membership, CRDT type, traffic timing, direction, and sizes also remain observable. `keyId` must not contain key material or sensitive labels. IVs are public protocol values, but they must be unique per key.
 
 ### 2.3 Cryptography Requirements
 
@@ -241,8 +255,11 @@ failure.
 ```ts
 const adaptor = new LoroAdaptor();
 adaptor.getDoc().setPeerId(1);
+// Generate once from at least 16 CSPRNG bytes and share out of band.
+// The relay still receives and can correlate the exact alias.
+const roomAlias = "<shared-random-128-bit-or-more-room-alias>";
 const room = await client.join({
-  roomId: "doc-123",
+  roomId: roomAlias,
   crdtAdaptor: adaptor,
   auth?: Uint8Array,           // Optional join metadata forwarded to the server.
 });
@@ -334,6 +351,10 @@ Key behaviors:
   fragmentation rather than hand-rolling your own.
 - When operating on `%ELO`, ensure your adaptor can fetch keys by `keyId` and
   pass 12-byte IVs to encryption helpers.
+- Use `wss://`, but remember that TLS protects only the path to its endpoint;
+  the TLS terminator and relay still see room IDs and ELO headers. Prefer a
+  non-semantic alias generated from ≥128 random CSPRNG bits; never treat it as
+  server-hidden or as authorization.
 - Subscribe to `onStatusChange` to gate CRDT mutations behind `Connected`.
 - Use `waitForReachingServerVersion()` before assuming local state matches the
   server (important after reconnects).

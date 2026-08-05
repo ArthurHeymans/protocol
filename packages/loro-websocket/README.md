@@ -55,11 +55,16 @@ await client.waitConnected();
 const adaptor = new EloAdaptor({
   getPrivateKey: async () => ({ keyId: "k1", key }),
 });
-await client.join({ roomId: "secure-room", crdtAdaptor: adaptor });
+// Generate once from at least 16 CSPRNG bytes and share out of band.
+// This non-semantic alias is still visible to and correlatable by the server.
+const roomAlias = "<shared-random-128-bit-or-more-room-alias>";
+await client.join({ roomId: roomAlias, crdtAdaptor: adaptor });
 
 adaptor.getDoc().getText("t").insert(0, "secret");
 adaptor.getDoc().commit();
 ```
+
+The key and alias above are placeholders. In production, load keys from application key management and use `wss://`. TLS protects the path to its endpoint, not protocol fields from the endpoint or relay. `%ELO` encrypts the document body, but the relay and any TLS terminator still see the room ID; record kind; raw peer IDs and delta `start`/`end` counters or snapshot peer/counter version-vector entries; `keyId`; IV; sizes; timing; and membership activity. Use non-sensitive `keyId` labels; IVs are public but must be unique per key. Prefer a non-semantic base64url or hex room alias generated from at least 128 random bits from a CSPRNG and shared through an authenticated, confidential application channel. It remains visible and correlatable by the server and does not replace authentication or authorization.
 
 ## Client API
 

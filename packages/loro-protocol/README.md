@@ -63,7 +63,10 @@ console.log(parsed.kind === EloRecordKind.Snapshot, out.plaintext);
 ```
 
 Notes
-- The server can parse %ELO headers to index/backfill but never decrypts `ct`.
+- A relay without the document key cannot decrypt `ct`, but it parses the plaintext %ELO headers to index/backfill.
+- Room IDs and ELO routing headers are visible to the relay and any TLS terminator. Headers expose record kind; raw peer IDs and delta `start`/`end` counters or snapshot peer/counter version-vector entries; `keyId`; and IV. Traffic timing and sizes remain observable. Use non-sensitive `keyId` labels; IVs are public but must be unique per key.
+- Prefer a non-semantic base64url or hex room alias generated from at least 128 random bits from a CSPRNG. The alias remains visible to the server, can be correlated, and is not a credential; authenticate and authorize separately.
+- Use an authenticated, encrypted transport in production (`wss://` for WebSockets). Transport encryption protects the path to its endpoint, not protocol fields from that endpoint or relay.
 - IV must be exactly 12 bytes and unique per key; AAD is the exact encoded header.
 
 ## API Surface

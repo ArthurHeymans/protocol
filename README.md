@@ -67,7 +67,7 @@ Tip: For a working reference, see `packages/loro-websocket/src/e2e.test.ts` whic
 
 ## E2EE (%ELO)
 
-`%ELO` adds end‑to‑end encryption to Loro sync. The server never decrypts; it indexes plaintext headers only to support backfill and routing. Clients encrypt/decrypt using AES‑GCM with a 12‑byte IV and the exact encoded header bytes as AAD.
+`%ELO` adds end‑to‑end encryption for Loro document bodies. A relay without the document key cannot decrypt the ciphertext, but it indexes plaintext headers for backfill and routing. The room ID and ELO headers are visible to the relay and any TLS terminator. Clients encrypt/decrypt using AES‑GCM with a 12‑byte IV and the exact encoded header bytes as AAD.
 
 - TypeScript: use `EloAdaptor` from `loro-adaptors` + `LoroWebsocketClient`.
   - Provide a `getPrivateKey()` hook that resolves `{ keyId, key }` (Web Crypto CryptoKey or Uint8Array).
@@ -92,7 +92,10 @@ await client.waitConnected();
 const adaptor = new EloAdaptor({
   getPrivateKey: async () => ({ keyId: "k1", key }),
 });
-const room = await client.join({ roomId: "elo-room", crdtAdaptor: adaptor });
+// Generate once from at least 16 CSPRNG bytes and share out of band.
+// This non-semantic alias is still visible to and correlatable by the server.
+const roomAlias = "<shared-random-128-bit-or-more-room-alias>";
+const room = await client.join({ roomId: roomAlias, crdtAdaptor: adaptor });
 
 // Edit the encrypted doc
 const text = adaptor.getDoc().getText("t");
@@ -105,6 +108,9 @@ await room.destroy();
 Notes:
 
 - Use a unique, non‑repeating 12‑byte IV per encryption for security (the adaptor accepts an optional `ivFactory()` for testing); the examples may fix IVs for determinism in tests only.
+- The literal key and alias placeholders above are documentation only. Load keys from application key management in production.
+- Use `wss://` in production. TLS protects frames in transit only as far as the TLS endpoint; the terminator and relay still receive the plaintext protocol envelope. Prefer a non-semantic base64url or hex room alias generated from at least 128 random bits from a CSPRNG, and share it through an authenticated, confidential application channel. The alias reduces meaning and guessability; it does not hide the identifier from the relay/TLS terminator, prevent correlation, or replace authentication and authorization.
+- ELO routing metadata remains plaintext: record kind; raw peer IDs and delta `start`/`end` counters or snapshot peer/counter version-vector entries; `keyId`; IV; container lengths; and traffic/membership metadata are visible. Use non-sensitive `keyId` labels. IVs are intentionally public but must be unique per key.
 - Keys and key agreement are application‑provided and out of scope.
 
 ### Cross‑language E2EE tests

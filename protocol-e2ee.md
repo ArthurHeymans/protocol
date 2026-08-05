@@ -12,10 +12,12 @@ Everything in protocol.md applies unless noted. In particular:
 
 - Magic bytes (first 4 bytes): add
   - "%ELO": E2EE Loro Document
-- Then `varBytes` room ID (max 128 bytes), 1‑byte message type, and payload.
+- Then `varString` room ID (max 128 UTF-8 bytes), 1‑byte message type, and payload.
 - Message types (0x00–0x07), errors, keepalive frames, fragmentation behavior, and size limits (≤256 KB per message; fragments allowed) are unchanged.
 
 Join/Leave, permissioning, and error codes work as in `%LOR`. The only difference is the content format of update payloads.
+
+The room ID remains a cleartext routing field. The relay and any TLS terminator can read the exact room ID; `%ELO` does not encrypt, hash, or otherwise hide it. Applications SHOULD use a non-semantic room alias generated from at least 128 random bits from a CSPRNG, encode it as base64url or hex, and share it through an authenticated, confidential application channel. An opaque alias reduces disclosure from a meaningful name, but remains visible and correlatable by the server and is not an authentication credential.
 
 ## Terminology
 
@@ -104,14 +106,14 @@ Rationale: An explicit random IV per record eliminates IV‑reuse risk and simpl
 
 Req and Recv follow the same join/sync rules as `%LOR`:
 
-- JoinRequest carries application-defined join metadata (often auth) and a document version (both opaque to the protocol). Recv may respond with JoinResponseOk, JoinError, and may push missing updates.
+- JoinRequest carries application-defined join metadata (often auth) and a document version. These fields are opaque only in the sense that the protocol does not interpret them; the relay and TLS terminator can read their bytes. Recv may respond with JoinResponseOk, JoinError, and may push missing updates.
 - When sending updates, Req packs one or more `%ELO` records into a `DocUpdate` payload. If large, use fragments per the base protocol.
 - Recv broadcasts received updates to other subscribers in the same room.
 - Leave unsubscribes from the room.
 
 ## Server Behavior (Indexing and Dedup)
 
-Although the server cannot decrypt, it SHOULD index the plaintext headers for efficient sync:
+The relay does not need the document key and cannot decrypt the CRDT body without it, but it can read and SHOULD index the plaintext routing headers for efficient sync:
 
 - Storage model: `Map<PeerID, Array<Span>>` where each Span is `[start,end)` with associated `keyId` and raw `record` bytes. Spans are kept sorted by `start`.
 - Dedup/merge (Span Override): On receiving a new DeltaSpan for `peerId = P` with span `[S,E)`, replace only if the new span fully covers existing spans for the same `peerId` (i.e., for each covered span `[s,e)`, `S ≤ s` and `E ≥ e`). This replacement is based solely on version metadata and applies regardless of `keyId`.
@@ -146,7 +148,7 @@ Key rotation is handled by publishing new records with a new `keyId`. Receivers 
 
 - Client‑local decrypt failures: Report via a local callback (e.g., `onError({ kind: 'decrypt_failed' | 'unknown_key', peerId, start, end, keyId })`). Servers cannot detect these.
 - Server rejections: Map header validation issues to `Ack.status=invalid_update`; size over limits to `Ack.status=payload_too_large`; fragment timeout behavior is unchanged from the base protocol.
-- Observability: For debugging, servers SHOULD log anonymized header fields (e.g., `peerId`, `start`, `end`, `keyId`) and high‑level outcomes. Servers MUST NOT log `ct` contents.
+- Observability: Servers SHOULD log only the minimum metadata needed for operations. Room IDs and header fields can be identifying or correlatable even when they use non-semantic values; if logged, apply appropriate access controls and retention. Servers MUST NOT log keys, decrypted CRDT bytes, or `ct` contents.
 
 ## Normative Test Vector (DeltaSpan)
 
@@ -171,7 +173,10 @@ Implementations MUST reproduce these values exactly to ensure cross‑language i
 - IV uniqueness: IV is explicit in each record and MUST be generated using a CSPRNG; do not reuse an IV under the same key.
 - Replay: Receivers SHOULD deduplicate by version metadata; replays are benign at the CRDT layer but may waste bandwidth.
 - Key rotation: Select non‑revealing `keyId` values; treat distribution as an application concern. Consider migrating to a fresh snapshot under the new key for compaction.
-- Confidentiality: Only `ct` is confidential; header fields are visible to intermediaries by design to enable routing and dedup.
+- Document confidentiality: Only the CRDT bytes inside `ct` are encrypted by `%ELO`. A relay that does not possess a document key cannot decrypt that body, but end-to-end encryption does not make the whole protocol exchange confidential.
+- Visible metadata: The relay and any TLS terminator can read the room ID, CRDT type, message type, join metadata, ELO container shape and lengths, and every plaintext ELO routing header. Delta headers expose `kind`, raw `peerId` bytes, `start`, `end`, `keyId`, and IV. Snapshot headers expose `kind`, every raw `peerId` and counter in the version vector, `keyId`, and IV. These values can correlate replicas, document progress, and key rotations. `keyId` MUST NOT contain key material or sensitive labels. IVs are intentionally public but MUST remain unique per key. The relay and terminator can also observe and correlate room membership, traffic timing, direction, and sizes.
+- Room aliases: Use random, non-semantic aliases generated from at least 128 random bits from a CSPRNG (base64url or hex) instead of meaningful room names. An alias is still sent to and known by the server, remains stable for correlation, and MUST NOT be treated as authorization. Distribute aliases through an authenticated, confidential application channel and enforce access separately.
+- Transport security: Use an authenticated, encrypted transport (`wss://` for WebSockets). It protects frames only on the path between its endpoints; the endpoint that terminates TLS and the relay that processes the protocol can read room IDs and ELO headers. Protect any separate proxy-to-relay hop as well.
 
 ## Compatibility
 

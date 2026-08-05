@@ -2014,7 +2014,7 @@ where
                                         res
                                     }
                                     CrdtType::Elo => {
-                                        // Index headers only; payload remains opaque to server.
+                                        // Index plaintext headers; the CRDT body remains ciphertext.
                                         h.apply_updates(&room, &updates)
                                     }
                                     _ => Ok(()),

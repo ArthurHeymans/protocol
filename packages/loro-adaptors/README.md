@@ -68,7 +68,10 @@ const roomPersisted = await client.join({
 // %ELO (end‑to‑end encrypted Loro)
 const keyring = new EloKeyring([{ keyId: "k1", key: new Uint8Array(32) }], "k1");
 const elo = new EloAdaptor({ keyResolver: keyring });
-const secure = await client.join({ roomId: "secure-room", crdtAdaptor: elo });
+// Generate once from at least 16 CSPRNG bytes and share out of band.
+// The relay still sees and can correlate this non-semantic alias.
+const roomAlias = "<shared-random-128-bit-or-more-room-alias>";
+const secure = await client.join({ roomId: roomAlias, crdtAdaptor: elo });
 
 // Rotation changes future writes while retaining k1 for historical records.
 keyring.addKey("k2", new Uint8Array(32));
@@ -109,6 +112,14 @@ const room = await client.join({ roomId: "flock-demo", crdtAdaptor: adaptor });
 import { YjsAwarenessServerAdaptor } from "loro-adaptors/yjs";
 // This is primarily for server-side use or specific awareness integration
 ```
+
+## %ELO privacy boundary
+
+`EloAdaptor` encrypts the Loro document body, not the wire envelope or routing metadata. The relay and any TLS terminator see the exact room ID; record kind; raw peer IDs and delta `start`/`end` counters or snapshot peer/counter version-vector entries; `keyId`; IV; container sizes; timing; and membership activity. Use non-sensitive `keyId` labels. IVs are public but must be unique per key.
+
+Use `wss://` and a non-semantic base64url or hex room alias generated from at least 128 random bits from a CSPRNG. Generate it once and share it through an authenticated, confidential application channel. TLS protects the path to its endpoint, not fields from the endpoint or relay. An opaque alias carries less meaning than a project or user name, but it is still visible to the server, remains correlatable, and is neither authentication nor authorization.
+
+The zero-filled keys and literal aliases in snippets are placeholders only; use application key management and CSPRNG-generated values in production.
 
 ## API
 

@@ -3,6 +3,8 @@ use loro_websocket_client::LoroWebsocketClient;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
+// Test-only interoperability key. Production applications must provision keys
+// through application key management.
 const KEY: [u8; 32] = [
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
     0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
@@ -10,10 +12,14 @@ const KEY: [u8; 32] = [
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Args: role receiver|sender, url, room
+    // Args: role receiver|sender, url, room alias.
+    // The relay and TLS terminator can read and correlate the alias. Production
+    // callers should generate a non-semantic alias from at least 16 bytes from
+    // an OS CSPRNG, share it through an authenticated, confidential channel,
+    // and still enforce authorization separately.
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.len() < 3 {
-        eprintln!("usage: elo_index_client <receiver|sender> <ws_url> <room_id>");
+        eprintln!("usage: elo_index_client <receiver|sender> <ws_url> <room_alias>");
         std::process::exit(2);
     }
     let role = args.remove(0);
@@ -62,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
         _ => {
-            eprintln!("usage: elo_index_client <receiver|sender> <ws_url> <room_id>");
+            eprintln!("usage: elo_index_client <receiver|sender> <ws_url> <room_alias>");
             std::process::exit(2);
         }
     }

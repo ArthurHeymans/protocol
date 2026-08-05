@@ -12,7 +12,7 @@ This is a test-first, cross-language hardening effort. Each stage starts by addi
 - Persist opaque raw records using the existing ELO container encoding. Do not introduce serde, bincode, or a TypeScript-only/Rust-only state format.
 - Retain the latest structurally valid snapshot plus indexed deltas by default. Send the snapshot before deltas it does not cover. Snapshot receipt does not delete deltas; authorized compaction is a separate policy.
 - Keep existing public APIs working where practical. Fixed-key Rust constructors wrap the new resolver, and existing TypeScript callbacks may ignore added metadata. Document any unavoidable signature or error-semantics change.
-- Room-name confidentiality is not part of this wire-compatible change. Recommend random opaque room aliases with at least 128 bits of entropy; aliases remain routing identifiers, not credentials.
+- Room-name confidentiality is not part of this wire-compatible change. Recommend random, non-semantic room aliases generated from at least 128 random bits from a CSPRNG; aliases remain cleartext routing identifiers visible to the relay and TLS terminator, not credentials, and do not prevent server-side correlation.
 
 ## Stage 1: Lock the crypto and plaintext contract
 
@@ -126,7 +126,7 @@ This is a test-first, cross-language hardening effort. Each stage starts by addi
 - Unknown-key retry succeeds after key installation, while a known wrong key remains a distinct failure.
 - Existing fixed-key/public APIs have regression coverage; new resolver, retry/error metadata, pending bounds, `publishSnapshot()`, and any unavoidable migration steps are documented.
 - Server telemetry is limited to non-secret header metadata/outcomes and never includes ciphertext or key bytes.
-- Documentation recommends random base64url/hex room aliases with at least 128 bits of entropy, excludes semantic names from room IDs, states that aliases are not authorization, and explains that room correlation/traffic/membership remain visible.
+- Documentation recommends random base64url/hex room aliases generated from at least 128 random bits from a CSPRNG, excludes semantic names from room IDs, states that aliases are not authorization, and explains that room correlation/traffic/membership remain visible.
 - No room-ID AAD/encrypted-routing change, snapshot compaction policy, key distribution system, revocation guarantee, or secrecy dependency is introduced.
 
 **Tests**:
@@ -135,7 +135,7 @@ This is a test-first, cross-language hardening effort. Each stage starts by addi
 - Extend ELO end-to-end suites with live late join, persistence restart, fragmented restore, historical-key rotation, new-key-only snapshot bootstrap, unknown-key retry, and malformed persisted-state cases.
 - Run `pnpm check`, `pnpm build`, `cargo test --workspace`, the cross-language suite, and targeted formatter checks with the repository-pinned pnpm toolchain and approved dependency build policy.
 
-**Status**: Not Started
+**Status**: In Progress (room-privacy documentation substage complete and reviewed: the protocol docs, package/Rust READMEs, LLM reference, and ELO examples now state that room IDs remain visible to the relay/TLS terminator; enumerate plaintext ELO `keyId`, IV, raw peer IDs, delta counters, and snapshot version-vector metadata; describe TLS as hop protection rather than encrypted routing; and recommend ≥128-bit non-semantic aliases without presenting them as server-hidden identifiers or credentials. The wire envelope and public API remain unchanged. Interoperability, rotation, and full-workspace gates remain pending.)
 
 ## Primary risks and review gates
 

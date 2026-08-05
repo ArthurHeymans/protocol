@@ -46,6 +46,12 @@ if let Some(msg) = try_decode(&buf) {
 }
 ```
 
+## Privacy boundary
+
+`%ELO` encrypts document bodies, not the protocol envelope. The relay and any TLS terminator can read the exact room ID; record kind; raw peer IDs and delta `start`/`end` counters or snapshot peer/counter version-vector entries; `keyId`; and IV. Traffic sizes, timing, and membership activity also remain observable. Use non-sensitive `keyId` labels; IVs are public but must be unique per key.
+
+For production ELO rooms, use an authenticated, encrypted transport (`wss://` for WebSockets) and a non-semantic base64url or hex room alias generated from at least 16 bytes from an OS CSPRNG. Share it through an authenticated, confidential application channel. Transport encryption protects the path to its endpoint, not protocol fields from that endpoint or relay. The alias remains visible and correlatable by the server and is not a credential; enforce authentication and authorization independently.
+
 ## Tests
 
 ```bash
