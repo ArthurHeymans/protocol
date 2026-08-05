@@ -39,6 +39,7 @@ import {
   LoroEphemeralAdaptor,
   LoroPersistentStoreAdaptor,
   EloAdaptor,
+  EloKeyring,
 } from "loro-adaptors/loro"; // Import from "loro-adaptors/loro" to avoid pulling in unused peer dependencies
 import { LoroDoc, EphemeralStore } from "loro-crdt";
 
@@ -65,11 +66,16 @@ const roomPersisted = await client.join({
 });
 
 // %ELO (end‑to‑end encrypted Loro)
-const key = new Uint8Array(32);
-const elo = new EloAdaptor({
-  getPrivateKey: async () => ({ keyId: "k1", key }),
-});
+const keyring = new EloKeyring([{ keyId: "k1", key: new Uint8Array(32) }], "k1");
+const elo = new EloAdaptor({ keyResolver: keyring });
 const secure = await client.join({ roomId: "secure-room", crdtAdaptor: elo });
+
+// Rotation changes future writes while retaining k1 for historical records.
+keyring.addKey("k2", new Uint8Array(32));
+keyring.setActiveKey("k2");
+await elo.publishSnapshot();
+// After fetching/installing a missing key:
+await elo.retryPendingEncryptedRecords();
 
 // Edits
 doc.getText("content").insert(0, "hello");
@@ -110,7 +116,10 @@ import { YjsAwarenessServerAdaptor } from "loro-adaptors/yjs";
   - `new LoroAdaptor(doc?: LoroDoc, config?: { onImportError?, onUpdateError? })`
   - `new LoroEphemeralAdaptor(store?: EphemeralStore)`
   - `new LoroPersistentStoreAdaptor(store?: EphemeralStore)`
-  - `new EloAdaptor(docOrConfig: LoroDoc | { getPrivateKey, ivFactory?, onDecryptError?, onUpdateError? })`
+  - `new EloAdaptor(docOrConfig: LoroDoc | { keyResolver?, getPrivateKey?, pendingEncryptedRecords?, onEloError?, ivFactory?, onDecryptError?, onUpdateError? })`
+  - `EloKeyResolver` and `EloKeyring` provide exact inbound `keyId` lookup plus active outbound key selection. Key IDs are immutable: `addKey` allows idempotent reinstall but rejects conflicting reuse, and byte keys are defensively copied.
+  - `publishSnapshot()` emits a fresh snapshot under the active key after earlier queued writes; `retryPendingEncryptedRecords()` retries the bounded, byte-exact deduplicated unknown-key queue in FIFO order.
+  - `onEloError` distinguishes `unknown_key`, `decrypt_failed`, malformed/import failures, outbound `encrypt_failed`, and pending eviction. The legacy generic import-error callback is still invoked, but ELO plaintext/ciphertext bytes are redacted from it. A custom `ivFactory` must return a fresh 12-byte IV; repeats are rejected before encryption.
 - `loro-adaptors/flock`
   - `new FlockAdaptor(flock: Flock, config?: { onImportError?, onUpdateError? })`
 - `loro-adaptors/yjs`

@@ -1,10 +1,11 @@
 # loro-websocket-client (Rust)
 
 Async WebSocket client for the Loro protocol. Exposes:
+
 - Low-level `Client` to send/receive raw `loro_protocol::ProtocolMessage`.
 - High-level `LoroWebsocketClient` that joins rooms and mirrors updates into a `loro::LoroDoc`, matching the TypeScript client behavior.
 
-> %ELO support is WIP: the Rust adaptor currently ships snapshot-only packaging for encrypted docs and APIs may change.
+%ELO support includes canonical delta packaging, application key resolution, rotation, bounded unknown-key retry, and genuine snapshot bootstrap. Key distribution/KMS remains application-owned.
 
 ## Quick start
 
@@ -24,9 +25,14 @@ let _room = client.join_loro("room1", doc.clone()).await?;
 ```
 
 ## Features
+
 - Handles protocol keepalive (`"ping"/"pong"`) and filters control frames.
 - Automatic fragmentation/reassembly thresholds aligned with the server.
-- %ELO adaptor helpers to encrypt/decrypt containers alongside Loro (experimental snapshot-only flow).
+- %ELO adaptor helpers encrypt/decrypt canonical deltas and genuine snapshots.
+- `EloKeyResolver` is the async application hook; `EloKeyring` selects an active outbound key while retaining historical read keys. `add_key` rejects conflicting key-ID reuse, and resolved key material uses redacted `Debug` output.
+- `join_elo_with_key_resolver` accepts a resolver. Room handles expose FIFO `retry_pending_encrypted_records` and `publish_elo_snapshot`; publication returns `false` if the room is read-only or preparation/encryption fails.
+- Structured ELO errors distinguish unknown keys, known-key authentication failures, malformed/import failures, outbound encryption failures, and pending eviction. Generic import callbacks receive the error message but not ELO plaintext/ciphertext bytes.
+- Fixed-key `EloDocAdaptor::new` and `join_elo_with_adaptor` remain compatibility wrappers.
 
 ## Tests
 

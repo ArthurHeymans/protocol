@@ -2,7 +2,7 @@ import { webcrypto } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import getPort from "get-port";
 import { WebSocket } from "ws";
-import { EloAdaptor } from "loro-adaptors/loro";
+import { EloAdaptor, EloKeyring } from "loro-adaptors/loro";
 import {
   BytesWriter,
   CrdtType,
@@ -72,14 +72,18 @@ describe("E2E: %ELO persistence", () => {
 
     const key = new Uint8Array(16);
     key[0] = 42;
+    const rotatedKey = new Uint8Array(16);
+    rotatedKey[0] = 84;
     const firstClient = new LoroWebsocketClient({
       url: `ws://localhost:${firstPort}`,
       disablePing: true,
     });
     await firstClient.waitConnected();
-    const firstAdaptor = new EloAdaptor({
-      getPrivateKey: async () => ({ keyId: "key-1", key }),
-    });
+    const firstKeyring = new EloKeyring(
+      [{ keyId: "key-1", key }],
+      "key-1"
+    );
+    const firstAdaptor = new EloAdaptor({ keyResolver: firstKeyring });
     const firstRoom = await firstClient.join({
       roomId: "persisted-elo",
       crdtAdaptor: firstAdaptor,
@@ -91,6 +95,9 @@ describe("E2E: %ELO persistence", () => {
         firstAdaptor.getDoc().getText("text").toString() === "survives restart",
       2_000
     );
+    firstKeyring.addKey("key-2", rotatedKey);
+    firstKeyring.setActiveKey("key-2");
+    await firstAdaptor.publishSnapshot();
     await new Promise(resolve => setTimeout(resolve, 150));
     await firstRoom.destroy();
     firstClient.destroy();
@@ -121,6 +128,11 @@ describe("E2E: %ELO persistence", () => {
     expect(
       records.map((record: Uint8Array) => parseEloRecordHeader(record).kind)
     ).toContain(EloRecordKind.Snapshot);
+    const persistedSnapshot = records.find(
+      record => parseEloRecordHeader(record).kind === EloRecordKind.Snapshot
+    );
+    if (!persistedSnapshot) throw new Error("Expected a persisted ELO snapshot");
+    expect(parseEloRecordHeader(persistedSnapshot).keyId).toBe("key-2");
     expect(
       containsSubarray(persisted, new TextEncoder().encode("survives restart"))
     ).toBe(false);
@@ -143,7 +155,10 @@ describe("E2E: %ELO persistence", () => {
     });
     await lateClient.waitConnected();
     const lateAdaptor = new EloAdaptor({
-      getPrivateKey: async () => ({ keyId: "key-1", key }),
+      keyResolver: new EloKeyring(
+        [{ keyId: "key-2", key: rotatedKey }],
+        "key-2"
+      ),
     });
     const lateRoom = await lateClient.join({
       roomId: "persisted-elo",
