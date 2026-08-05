@@ -77,7 +77,9 @@ export function parseEloRecordHeader(
     const peerId = r.readVarBytes();
     const startCounter = r.readUleb128();
     const endCounter = r.readUleb128();
-    const keyId = r.readVarString();
+    const keyId = new TextDecoder("utf-8", { fatal: true }).decode(
+      r.readVarBytes()
+    );
     const iv = r.readVarBytes();
     const headerBytes = recordBytes.slice(0, r.position);
     const ct = r.readVarBytes();
@@ -101,13 +103,18 @@ export function parseEloRecordHeader(
     };
   } else if (kind === EloRecordKind.Snapshot) {
     const vvCount = r.readUleb128();
+    if (vvCount > 1024) {
+      throw new Error("Invalid ELO snapshot: vv has more than 1024 entries");
+    }
     const vv: EloSnapshotVVEntry[] = [];
     for (let j = 0; j < vvCount; j++) {
       const peerId = r.readVarBytes();
       const counter = r.readUleb128();
       vv.push({ peerId, counter });
     }
-    const keyId = r.readVarString();
+    const keyId = new TextDecoder("utf-8", { fatal: true }).decode(
+      r.readVarBytes()
+    );
     const iv = r.readVarBytes();
     const headerBytes = recordBytes.slice(0, r.position);
     const ct = r.readVarBytes();
@@ -154,10 +161,13 @@ export async function importAesGcmKey(key: Uint8Array): Promise<CryptoKey> {
     throw new Error("AES-GCM key must be 16 or 32 bytes");
   }
   // Pass ArrayBuffer to satisfy BufferSource typing
-  return await getSubtle().importKey("raw", toArrayBuffer(key), { name: "AES-GCM" }, false, [
-    "encrypt",
-    "decrypt",
-  ]);
+  return await getSubtle().importKey(
+    "raw",
+    toArrayBuffer(key),
+    { name: "AES-GCM" },
+    false,
+    ["encrypt", "decrypt"]
+  );
 }
 
 export function randomIv12(): Uint8Array {
@@ -176,7 +186,11 @@ export async function aesGcmEncrypt(
   const k = key instanceof Uint8Array ? await importAesGcmKey(key) : key;
   if (iv.length !== 12) throw new Error("IV must be 12 bytes");
   const res = await subtle.encrypt(
-    { name: "AES-GCM", iv: toArrayBuffer(iv), additionalData: aad ? toArrayBuffer(aad) : undefined },
+    {
+      name: "AES-GCM",
+      iv: toArrayBuffer(iv),
+      additionalData: aad ? toArrayBuffer(aad) : undefined,
+    },
     k,
     toArrayBuffer(plaintext)
   );
@@ -194,7 +208,11 @@ export async function aesGcmDecrypt(
   const k = key instanceof Uint8Array ? await importAesGcmKey(key) : key;
   if (iv.length !== 12) throw new Error("IV must be 12 bytes");
   const res = await subtle.decrypt(
-    { name: "AES-GCM", iv: toArrayBuffer(iv), additionalData: aad ? toArrayBuffer(aad) : undefined },
+    {
+      name: "AES-GCM",
+      iv: toArrayBuffer(iv),
+      additionalData: aad ? toArrayBuffer(aad) : undefined,
+    },
     k,
     toArrayBuffer(ct)
   );

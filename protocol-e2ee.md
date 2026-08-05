@@ -43,7 +43,7 @@ For `%ELO`, the payload in `DocUpdate` (0x03) and in the reassembled bytes of `D
 
 ### Container Encoding
 
-```
+```text
 DocUpdatePayload :=
   varUint N                       // number of records
   record[0] .. record[N-1]
@@ -57,7 +57,7 @@ Implementations SHOULD fragment at the protocol layer if the serialized payload 
 
 Two record kinds are defined: delta span updates and snapshots.
 
-```
+```text
 // Common
 u8 kind                           // 0x00 = DeltaSpan, 0x01 = Snapshot
 
@@ -117,7 +117,7 @@ Although the server cannot decrypt, it SHOULD index the plaintext headers for ef
 - Dedup/merge (Span Override): On receiving a new DeltaSpan for `peerId = P` with span `[S,E)`, replace only if the new span fully covers existing spans for the same `peerId` (i.e., for each covered span `[s,e)`, `S ≤ s` and `E ≥ e`). This replacement is based solely on version metadata and applies regardless of `keyId`.
 - Querying: Given a requester version vector `VV`, send all delta spans where `end > VV[peerId]` (i.e., spans that extend beyond the requester’s counter for that `peerId`).
 - Validation: Servers SHOULD validate header encodings (e.g., `end > start`, for DeltaSpan plaintext, `iv` length == 12, recommended `peerId`/`keyId` bounds) and reject malformed updates with `Ack.status=invalid_update`. Over‑limit payloads SHOULD be rejected with `Ack.status=payload_too_large`.
-- Snapshots: On receiving a snapshot record, applications MAY choose to replace prior stored deltas according to their retention policy (e.g., keep a window of recent deltas). Authorization for snapshot override is an application concern.
+- Snapshots and retention: The default relay policy is deliberately simple: retain the latest structurally valid snapshot record plus all non-obsolete indexed delta records. Persistence exports use the standard ELO container with the snapshot first, followed by deterministic peer/span-ordered deltas. For backfill, send a retained snapshot when it advances the requester, then only deltas extending the pointwise maximum of the requester and snapshot version vectors. Receiving a snapshot MUST NOT delete delta coverage. Destructive compaction or snapshot authorization is an explicit application policy and is outside this default.
 
 The server MUST treat `keyId` as opaque metadata and MUST NOT rely on or require any specific format.
 
@@ -125,8 +125,10 @@ The server MUST treat `keyId` as opaque metadata and MUST NOT rely on or require
 
 Clients typically need a hook to resolve keys:
 
-```
-type GetPrivateKey = (keyId?: string) => Promise<{ keyId: string; key: Uint8Array }>;
+```ts
+type GetPrivateKey = (
+  keyId?: string
+) => Promise<{ keyId: string; key: Uint8Array }>;
 ```
 
 - Export: when sending, export CRDT updates as contiguous spans per peer, encrypt each span into a DeltaSpan record, then encode into the container.

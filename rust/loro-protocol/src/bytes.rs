@@ -119,16 +119,19 @@ impl<'a> BytesReader<'a> {
         let mut shift: u32 = 0;
         loop {
             let byte = self.read_byte()?;
-            result |= u64::from(byte & 0x7f) << shift;
+            let value = u64::from(byte & 0x7f);
+            if shift == 63 && value > 1 {
+                return Err("uleb128 overflows u64".into());
+            }
+            result |= value << shift;
             if (byte & 0x80) == 0 {
-                break;
+                return Ok(result);
             }
             shift += 7;
             if shift > 63 {
                 return Err("uleb128 too large".into());
             }
         }
-        Ok(result)
     }
 
     pub fn read_var_bytes(&mut self) -> Result<&'a [u8], String> {
@@ -185,6 +188,15 @@ mod tests {
         }
         assert_eq!(out, values);
         assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn rejects_uleb128_overflow() {
+        let overflowing = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
+        assert_eq!(
+            BytesReader::new(&overflowing).read_uleb128(),
+            Err("uleb128 overflows u64".into())
+        );
     }
 
     #[test]

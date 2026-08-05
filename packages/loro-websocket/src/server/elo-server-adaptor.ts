@@ -1,11 +1,6 @@
 import type { CrdtServerAdaptor } from "loro-adaptors";
-import {
-  CrdtType,
-  JoinResponseOk,
-  MessageType,
-} from "loro-protocol";
+import { CrdtType, type JoinResponseOk, MessageType } from "loro-protocol";
 import { EloDoc } from "./elo-doc";
-
 
 export class EloServerAdaptor implements CrdtServerAdaptor {
   readonly crdtType = CrdtType.Elo;
@@ -16,7 +11,7 @@ export class EloServerAdaptor implements CrdtServerAdaptor {
 
   handleJoinRequest(
     documentData: Uint8Array,
-    clientVersion: Uint8Array,
+    clientVersion: Uint8Array
   ): {
     response: JoinResponseOk;
     updates?: Uint8Array[];
@@ -24,7 +19,7 @@ export class EloServerAdaptor implements CrdtServerAdaptor {
     const doc = new EloDoc();
     const load = doc.loadFromEncodedState(documentData);
     if (!load.ok) {
-      console.warn("[ELO] failed to load indexed state:", load.error);
+      throw new Error(`Failed to load persisted ELO state: ${load.error}`);
     }
 
     const response: JoinResponseOk = {
@@ -43,17 +38,12 @@ export class EloServerAdaptor implements CrdtServerAdaptor {
     };
   }
 
-  applyUpdates(
-    documentData: Uint8Array,
-    updates: Uint8Array[],
-  ): Uint8Array {
+  applyUpdates(documentData: Uint8Array, updates: Uint8Array[]): Uint8Array {
     const doc = new EloDoc();
     const load = doc.loadFromEncodedState(documentData);
     if (!load.ok) {
       throw new Error(load.error, { cause: load.error });
     }
-
-    const broadcastUpdates: Uint8Array[] = [];
 
     for (const update of updates) {
       if (!update.length) continue;
@@ -61,19 +51,16 @@ export class EloServerAdaptor implements CrdtServerAdaptor {
       if (!res.ok) {
         throw new Error(res.error, { cause: res.error });
       }
-      broadcastUpdates.push(update);
     }
 
-    const newDocumentData = doc.exportIndexedRecords();
-    return newDocumentData;
+    return doc.exportIndexedRecords();
   }
 
   getVersion(documentData: Uint8Array): Uint8Array {
     const doc = new EloDoc();
     const load = doc.loadFromEncodedState(documentData);
     if (!load.ok) {
-      console.warn("[ELO] failed to load indexed state:", load.error);
-      return new Uint8Array();
+      throw new Error(`Failed to load persisted ELO state: ${load.error}`);
     }
     return doc.getVersionBytes();
   }

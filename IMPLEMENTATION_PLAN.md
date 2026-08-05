@@ -88,7 +88,7 @@ This is a test-first, cross-language hardening effort. Each stage starts by addi
 - Retain live relay and fragmentation regression coverage in `packages/loro-websocket/tests/e2e-elo.test.ts`, `rust/loro-websocket-server/tests/elo_accept_broadcast.rs`, and `rust/loro-websocket-server/tests/elo_fragment_reassembly.rs`.
 - Run `pnpm --filter @karstenda/loro-websocket test`, its typecheck, and `cargo test -p loro-websocket-server`.
 
-**Status**: Not Started
+**Status**: In Progress (final persistence review added direct TypeScript/Rust coverage for byte-stable identity/order, key-independent span replacement, atomic malformed batches, snapshot/delta retention, persisted index restoration, filtered backfill, Loro counter bounds, empty-container rejection, and safe ULEB128 overflow handling. Cross-language VersionVector fixtures and the remaining full validation matrix are still pending.)
 
 ## Stage 4: Integrate durable ELO load/save and restart recovery
 
@@ -112,7 +112,7 @@ This is a test-first, cross-language hardening effort. Each stage starts by addi
 - Verify saved bytes decode as a standard ELO container in both TypeScript and Rust and contain opaque original records, not decrypted CRDT data.
 - Run package tests/typechecks, `cargo test --workspace`, and the persistence example where practical.
 
-**Status**: Not Started
+**Status**: Complete (final review fixed TypeScript shutdown and concurrent-load races, serialized generation-safe saves, kept Rust callbacks outside the hub lock with generation-safe dirty clearing, made ELO state import atomic, and bounded corrupt container/ULEB128 handling. Corrupt-load, fragmented opaque restore, no-plaintext, byte-stability, retention, index-restoration, restart/late-join, and save-race coverage passes in both languages. The focused TypeScript package tests/typechecks and Rust protocol/server suites pass.)
 
 ## Stage 5: Prove rotation, interoperability, and operational guidance
 
@@ -133,7 +133,7 @@ This is a test-first, cross-language hardening effort. Each stage starts by addi
 
 - Enable and stabilize `rust/loro-websocket-server/tests/elo_cross_lang.rs` and `pnpm test:cross-lang` for normative encryption plus TS↔Rust delta/snapshot exchange.
 - Extend ELO end-to-end suites with live late join, persistence restart, fragmented restore, historical-key rotation, new-key-only snapshot bootstrap, unknown-key retry, and malformed persisted-state cases.
-- Run `pnpm check`, `pnpm build`, `cargo test --workspace`, the cross-language suite, and targeted formatter checks. Resolve the current pnpm ignored-build-script policy through the repository-approved dependency workflow rather than bypassing it.
+- Run `pnpm check`, `pnpm build`, `cargo test --workspace`, the cross-language suite, and targeted formatter checks with the repository-pinned pnpm toolchain and approved dependency build policy.
 
 **Status**: Not Started
 
@@ -146,4 +146,4 @@ This is a test-first, cross-language hardening effort. Each stage starts by addi
 - **Retry memory pressure**: Pending unknown-key records need conservative byte/count caps, deterministic deduplication, and visible eviction behavior.
 - **Persistence races/durability**: TypeScript must not clear dirty state after saving stale data. Rust restart durability remains periodic without a compatible shutdown-flush lifecycle.
 - **Legacy recovery**: A relay cannot reinterpret old encrypted snapshot-kind/delta-plaintext records. Deployments may need a connected old client to publish a fresh genuine snapshot before relying on restart/new-key bootstrap.
-- **Tooling**: The current pnpm environment blocks ignored dependency build scripts. Do not bypass the policy; use the repository-approved install/build configuration before declaring TypeScript gates green.
+- **Tooling**: Use `corepack pnpm@10.17.1` and the repository-approved dependency build policy; do not introduce workspace-policy changes merely to make local gates pass.

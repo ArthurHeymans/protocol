@@ -351,178 +351,339 @@ impl CrdtDoc for PersistentEphemeralRoomDoc {
     }
 }
 
-// ELO header index entries
+#[derive(Clone)]
 struct EloDeltaSpanIndexEntry {
     start: u64,
     end: u64,
-    key_id: String,
     record: Vec<u8>,
 }
 
+#[derive(Clone)]
+struct EloSnapshotIndexEntry {
+    vv: Vec<(Vec<u8>, u64)>,
+    record: Vec<u8>,
+}
+
+#[derive(Clone)]
 struct EloRoomDoc {
-    spans_by_peer: std::collections::HashMap<String, Vec<EloDeltaSpanIndexEntry>>,
+    spans_by_peer: HashMap<Vec<u8>, Vec<EloDeltaSpanIndexEntry>>,
+    latest_snapshot: Option<EloSnapshotIndexEntry>,
 }
 impl EloRoomDoc {
     fn new() -> Self {
         Self {
-            spans_by_peer: std::collections::HashMap::new(),
+            spans_by_peer: HashMap::new(),
+            latest_snapshot: None,
         }
     }
 
-    fn peer_key_from_bytes(bytes: &[u8]) -> String {
-        // Prefer UTF-8 if valid, else hex
-        match std::str::from_utf8(bytes) {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                let mut out = String::with_capacity(bytes.len() * 2);
-                for b in bytes {
-                    use std::fmt::Write as _;
-                    let _ = write!(&mut out, "{:02x}", b);
-                }
-                out
-            }
-        }
+    fn canonical_loro_peer(bytes: &[u8]) -> Option<u64> {
+        let text = std::str::from_utf8(bytes).ok()?;
+        let peer = text.parse::<u64>().ok()?;
+        (peer.to_string() == text).then_some(peer)
     }
 
-    fn decode_version_vector(&self, buf: &[u8]) -> Option<std::collections::HashMap<String, u64>> {
-        use loro_protocol::bytes::BytesReader;
-        let mut r = BytesReader::new(buf);
-        let count = usize::try_from(r.read_uleb128().ok()?).ok()?;
-        let mut map: std::collections::HashMap<String, u64> =
-            std::collections::HashMap::with_capacity(count);
-        for _ in 0..count {
-            let peer_bytes = r.read_var_bytes().ok()?;
-            let ctr = r.read_uleb128().ok()?;
-            map.insert(Self::peer_key_from_bytes(peer_bytes), ctr);
-        }
-        Some(map)
+    fn requester_counter(requester: Option<&loro::VersionVector>, peer: &[u8]) -> u64 {
+        let Some(peer) = Self::canonical_loro_peer(peer) else {
+            return 0;
+        };
+        requester
+            .and_then(|vv| vv.get(&peer))
+            .and_then(|counter| u64::try_from(*counter).ok())
+            .unwrap_or(0)
     }
 
     fn encode_current_vv(&self) -> Vec<u8> {
-        use loro_protocol::bytes::BytesWriter;
-        let mut entries: Vec<(String, u64)> = Vec::new();
-        for (peer, spans) in self.spans_by_peer.iter() {
-            if !peer.as_bytes().iter().all(|b| b.is_ascii_digit()) {
+        let mut counters: HashMap<u64, u64> = HashMap::new();
+        for (peer, spans) in &self.spans_by_peer {
+            let Some(peer) = Self::canonical_loro_peer(peer) else {
                 continue;
-            }
-            let mut max_end = 0u64;
-            for s in spans.iter() {
-                if s.end > max_end {
-                    max_end = s.end;
-                }
-            }
-            if max_end > 0 {
-                entries.push((peer.clone(), max_end));
+            };
+            for span in spans {
+                counters
+                    .entry(peer)
+                    .and_modify(|counter| *counter = (*counter).max(span.end))
+                    .or_insert(span.end);
             }
         }
-        let mut w = BytesWriter::new();
-        w.push_uleb128(entries.len() as u64);
-        for (peer, ctr) in entries.iter() {
-            w.push_var_bytes(peer.as_bytes());
-            w.push_uleb128(*ctr);
+        if let Some(snapshot) = &self.latest_snapshot {
+            for (peer, counter) in &snapshot.vv {
+                let Some(peer) = Self::canonical_loro_peer(peer) else {
+                    continue;
+                };
+                counters
+                    .entry(peer)
+                    .and_modify(|current| *current = (*current).max(*counter))
+                    .or_insert(*counter);
+            }
         }
-        w.finalize()
+
+        let mut vv = loro::VersionVector::default();
+        for (peer, counter) in counters {
+            if let Ok(counter) = i32::try_from(counter) {
+                vv.insert(peer, counter);
+            }
+        }
+        if vv.is_empty() {
+            Vec::new()
+        } else {
+            vv.encode()
+        }
     }
-}
-impl CrdtDoc for EloRoomDoc {
-    fn get_version(&self) -> Vec<u8> {
-        // If we have no indexed entries yet, return an empty version to signal
-        // "unknown/empty" baseline so clients may choose to send a snapshot.
-        if self.spans_by_peer.is_empty() {
-            return Vec::new();
+
+    fn export_persisted_state(&self) -> Vec<u8> {
+        let mut records: Vec<&[u8]> = Vec::new();
+        if let Some(snapshot) = &self.latest_snapshot {
+            records.push(&snapshot.record);
         }
-        self.encode_current_vv()
-    }
-    fn compute_backfill(&self, client_version: &[u8]) -> Vec<Vec<u8>> {
-        let known = self
-            .decode_version_vector(client_version)
-            .unwrap_or_default();
-        let mut records: Vec<Vec<u8>> = Vec::new();
-        for (peer, spans) in self.spans_by_peer.iter() {
-            let k = known.get(peer).copied().unwrap_or(0);
-            for e in spans {
-                if e.end > k {
-                    records.push(e.record.clone());
-                }
+        let mut peers: Vec<_> = self.spans_by_peer.iter().collect();
+        peers.sort_by_key(|(left, _)| *left);
+        for (_, spans) in peers {
+            for span in spans {
+                records.push(&span.record);
             }
         }
-        if records.is_empty() {
-            return Vec::new();
-        }
-        let mut w = loro_protocol::bytes::BytesWriter::new();
-        w.push_uleb128(records.len() as u64);
-        for rec in records.iter() {
-            w.push_var_bytes(rec);
-        }
-        vec![w.finalize()]
+        loro_protocol::elo::encode_elo_container(records)
     }
-    fn apply_updates(&mut self, updates: &[Vec<u8>]) -> Result<(), String> {
+
+    fn index_updates(&mut self, updates: &[Vec<u8>]) -> Result<(), String> {
         use loro_protocol::elo::{
             decode_elo_container, parse_elo_record_header, EloHeader, EloRecordKind,
         };
-        for u in updates {
-            let records = decode_elo_container(u.as_slice())?;
-            for rec in records {
-                let parsed = parse_elo_record_header(rec)?;
-                match parsed.kind {
-                    EloRecordKind::DeltaSpan => {
-                        if let EloHeader::Delta(h) = parsed.header {
-                            if !(h.end > h.start) {
-                                return Err("invalid ELO delta span: end must be > start".into());
-                            }
-                            if h.iv.len() != 12 {
-                                return Err("invalid ELO delta span: IV must be 12 bytes".into());
-                            }
-                            let peer = Self::peer_key_from_bytes(&h.peer_id);
-                            let list = self.spans_by_peer.entry(peer).or_default();
-                            // Insert keeping order by start; remove fully covered entries [start, end]
-                            let mut kept: Vec<EloDeltaSpanIndexEntry> =
-                                Vec::with_capacity(list.len() + 1);
-                            let mut inserted = false;
-                            for e in list.iter() {
-                                if !inserted && e.start >= h.start {
-                                    kept.push(EloDeltaSpanIndexEntry {
-                                        start: h.start,
-                                        end: h.end,
-                                        key_id: h.key_id.clone(),
-                                        record: rec.to_vec(),
-                                    });
-                                    inserted = true;
-                                }
-                                // keep entries not fully covered by [start, end]
-                                let covered = e.start >= h.start && e.end <= h.end;
-                                if !covered {
-                                    kept.push(EloDeltaSpanIndexEntry {
-                                        start: e.start,
-                                        end: e.end,
-                                        key_id: e.key_id.clone(),
-                                        record: e.record.clone(),
-                                    });
-                                }
-                            }
-                            if !inserted {
-                                kept.push(EloDeltaSpanIndexEntry {
-                                    start: h.start,
-                                    end: h.end,
-                                    key_id: h.key_id.clone(),
-                                    record: rec.to_vec(),
-                                });
-                            }
-                            *list = kept;
+        for update in updates {
+            let records = decode_elo_container(update)?;
+            if records.is_empty() {
+                return Err("invalid ELO container: expected at least one record".into());
+            }
+            for record in records {
+                let parsed = parse_elo_record_header(record)?;
+                match parsed.header {
+                    EloHeader::Delta(header) => {
+                        let list = self.spans_by_peer.entry(header.peer_id).or_default();
+                        if list
+                            .iter()
+                            .any(|entry| entry.start <= header.start && entry.end >= header.end)
+                        {
+                            continue;
                         }
+                        list.retain(|entry| {
+                            !(entry.start >= header.start && entry.end <= header.end)
+                        });
+                        list.push(EloDeltaSpanIndexEntry {
+                            start: header.start,
+                            end: header.end,
+                            record: record.to_vec(),
+                        });
+                        list.sort_by_key(|entry| (entry.start, entry.end));
                     }
-                    EloRecordKind::Snapshot => {
-                        // Snapshot header validation already done by parser; no indexing needed
+                    EloHeader::Snapshot(header) => {
+                        if parsed.kind != EloRecordKind::Snapshot {
+                            return Err("invalid ELO snapshot header".into());
+                        }
+                        if header.vv.len() > 1024 {
+                            return Err(
+                                "invalid ELO snapshot: version vector has more than 1024 entries"
+                                    .into(),
+                            );
+                        }
+                        if header.vv.iter().any(|(peer, _)| peer.len() > 64) {
+                            return Err("invalid ELO snapshot: peerId too long".into());
+                        }
+                        if header
+                            .vv
+                            .windows(2)
+                            .any(|entries| entries[0].0 >= entries[1].0)
+                        {
+                            return Err(
+                                "invalid ELO snapshot: version vector peers not strictly sorted"
+                                    .into(),
+                            );
+                        }
+                        self.latest_snapshot = Some(EloSnapshotIndexEntry {
+                            vv: header.vv,
+                            record: record.to_vec(),
+                        });
                     }
                 }
             }
         }
         Ok(())
     }
+}
+impl CrdtDoc for EloRoomDoc {
+    fn get_version(&self) -> Vec<u8> {
+        self.encode_current_vv()
+    }
+
+    fn compute_backfill(&self, client_version: &[u8]) -> Vec<Vec<u8>> {
+        let requester = (!client_version.is_empty())
+            .then(|| loro::VersionVector::decode(client_version).ok())
+            .flatten();
+        let mut effective: HashMap<Vec<u8>, u64> = HashMap::new();
+        for peer in self.spans_by_peer.keys() {
+            effective.insert(
+                peer.clone(),
+                Self::requester_counter(requester.as_ref(), peer),
+            );
+        }
+
+        let mut records: Vec<Vec<u8>> = Vec::new();
+        if let Some(snapshot) = &self.latest_snapshot {
+            let requester_covers_snapshot = requester.is_some()
+                && snapshot.vv.iter().all(|(peer, counter)| {
+                    Self::requester_counter(requester.as_ref(), peer) >= *counter
+                });
+            if !requester_covers_snapshot {
+                records.push(snapshot.record.clone());
+                for (peer, counter) in &snapshot.vv {
+                    effective
+                        .entry(peer.clone())
+                        .and_modify(|known| *known = (*known).max(*counter))
+                        .or_insert(*counter);
+                }
+            }
+        }
+
+        let mut peers: Vec<_> = self.spans_by_peer.iter().collect();
+        peers.sort_by_key(|(left, _)| *left);
+        for (peer, spans) in peers {
+            let known = effective.get(peer).copied().unwrap_or(0);
+            for span in spans {
+                if span.end > known {
+                    records.push(span.record.clone());
+                }
+            }
+        }
+        if records.is_empty() {
+            Vec::new()
+        } else {
+            vec![loro_protocol::elo::encode_elo_container(records)]
+        }
+    }
+
+    fn apply_updates(&mut self, updates: &[Vec<u8>]) -> Result<(), String> {
+        let mut candidate = self.clone();
+        candidate.index_updates(updates)?;
+        *self = candidate;
+        Ok(())
+    }
+
+    fn should_persist(&self) -> bool {
+        true
+    }
+
+    fn export_snapshot(&self) -> Option<Vec<u8>> {
+        Some(self.export_persisted_state())
+    }
+
+    fn import_snapshot(&mut self, data: &[u8]) -> Result<(), String> {
+        let mut candidate = Self::new();
+        if !data.is_empty() {
+            candidate.index_updates(&[data.to_vec()])?;
+        }
+        *self = candidate;
+        Ok(())
+    }
+
     fn allow_backfill_when_no_other_clients(&self) -> bool {
         true
     }
 }
+
+#[cfg(test)]
+mod elo_room_doc_tests {
+    use super::*;
+    use loro_protocol::bytes::BytesWriter;
+    use loro_protocol::elo::{decode_elo_container, encode_elo_container};
+
+    #[test]
+    fn persistence_round_trip_retains_snapshot_and_restores_delta_index() {
+        let snapshot = snapshot_record(&[(b"7", 2)], 1);
+        let covered = delta_record(b"7", 0, 2, "old-key", 2);
+        let later = delta_record(b"7", 2, 3, "new-key", 3);
+        let persisted =
+            encode_elo_container([snapshot.as_slice(), covered.as_slice(), later.as_slice()]);
+        let mut restored = EloRoomDoc::new();
+
+        restored.import_snapshot(&persisted).unwrap();
+        assert_eq!(restored.export_persisted_state(), persisted);
+        let backfill = restored.compute_backfill(&[]);
+        assert_eq!(backfill.len(), 1);
+        assert_eq!(
+            decode_elo_container(&backfill[0]).unwrap(),
+            vec![snapshot.as_slice(), later.as_slice()]
+        );
+
+        let mut current = loro::VersionVector::default();
+        current.insert(7, 3);
+        assert!(restored.compute_backfill(&current.encode()).is_empty());
+    }
+
+    #[test]
+    fn indexing_is_byte_stable_atomic_and_key_independent() {
+        let old = delta_record(b"7", 1, 2, "old-key", 1);
+        let covering = delta_record(b"7", 0, 3, "new-key", 2);
+        let stale = delta_record(b"7", 1, 2, "third-key", 3);
+        let partial = delta_record(b"7", 2, 4, "partial-key", 4);
+        let ascii_ff = delta_record(b"ff", 0, 1, "key", 5);
+        let opaque_ff = delta_record(&[0xff], 0, 1, "key", 6);
+        let mut document = EloRoomDoc::new();
+        document
+            .apply_updates(&[encode_elo_container([
+                old.as_slice(),
+                covering.as_slice(),
+                stale.as_slice(),
+                partial.as_slice(),
+                opaque_ff.as_slice(),
+                ascii_ff.as_slice(),
+            ])])
+            .unwrap();
+
+        assert_eq!(
+            decode_elo_container(&document.export_persisted_state()).unwrap(),
+            vec![
+                covering.as_slice(),
+                partial.as_slice(),
+                ascii_ff.as_slice(),
+                opaque_ff.as_slice(),
+            ]
+        );
+        let before = document.export_persisted_state();
+        assert!(document.apply_updates(&[vec![0xff]]).is_err());
+        assert_eq!(document.export_persisted_state(), before);
+        assert!(document
+            .apply_updates(&[encode_elo_container(Vec::<Vec<u8>>::new())])
+            .is_err());
+        assert_eq!(document.export_persisted_state(), before);
+    }
+
+    fn snapshot_record(vv: &[(&[u8], u64)], marker: u8) -> Vec<u8> {
+        let mut record = BytesWriter::new();
+        record.push_byte(0x01);
+        record.push_uleb128(vv.len() as u64);
+        for (peer, counter) in vv {
+            record.push_var_bytes(peer);
+            record.push_uleb128(*counter);
+        }
+        record.push_var_string("key-1");
+        record.push_var_bytes(&[marker; 12]);
+        record.push_var_bytes(&[marker]);
+        record.finalize()
+    }
+
+    fn delta_record(peer: &[u8], start: u64, end: u64, key: &str, marker: u8) -> Vec<u8> {
+        let mut record = BytesWriter::new();
+        record.push_byte(0x00);
+        record.push_var_bytes(peer);
+        record.push_uleb128(start);
+        record.push_uleb128(end);
+        record.push_var_string(key);
+        record.push_var_bytes(&[marker; 12]);
+        record.push_var_bytes(&[marker]);
+        record.finalize()
+    }
+}
+
 impl<DocCtx> Default for ServerConfig<DocCtx> {
     fn default() -> Self {
         Self {
@@ -551,6 +712,7 @@ impl<DocCtx> Default for ServerConfig<DocCtx> {
 struct RoomDocState<DocCtx> {
     doc: Box<dyn CrdtDoc>,
     dirty: bool,
+    generation: u64,
     ctx: Option<DocCtx>,
 }
 
@@ -698,6 +860,7 @@ where
                     RoomDocState {
                         doc: Box::new(d),
                         dirty: false,
+                        generation: 0,
                         ctx,
                     },
                 );
@@ -709,6 +872,7 @@ where
                     RoomDocState {
                         doc: Box::new(d),
                         dirty: false,
+                        generation: 0,
                         ctx: None,
                     },
                 );
@@ -741,18 +905,41 @@ where
                     RoomDocState {
                         doc: Box::new(d),
                         dirty: false,
+                        generation: 0,
                         ctx,
                     },
                 );
             }
             CrdtType::Elo => {
-                let d = EloRoomDoc::new();
+                let mut document = EloRoomDoc::new();
+                let mut ctx = None;
+                if let Some(loader) = &self.config.on_load_document {
+                    let args = LoadDocArgs {
+                        workspace: self.workspace.clone(),
+                        room: room.room.clone(),
+                        crdt: room.crdt,
+                    };
+                    match (loader)(args).await {
+                        Ok(loaded) => {
+                            if let Some(bytes) = loaded.snapshot {
+                                document.import_snapshot(&bytes).map_err(|error| {
+                                    format!("load persisted ELO state failed: {error}")
+                                })?;
+                            }
+                            ctx = loaded.ctx;
+                        }
+                        Err(error) => {
+                            return Err(format!("load persisted ELO state failed: {error}"));
+                        }
+                    }
+                }
                 self.docs.insert(
                     room.clone(),
                     RoomDocState {
-                        doc: Box::new(d),
+                        doc: Box::new(document),
                         dirty: false,
-                        ctx: None,
+                        generation: 0,
+                        ctx,
                     },
                 );
             }
@@ -788,6 +975,9 @@ where
             .docs
             .get_mut(room)
             .ok_or_else(|| "room not found".to_string())?;
+        let persisted_before = (room.crdt == CrdtType::Elo)
+            .then(|| state.doc.export_snapshot())
+            .flatten();
         state
             .doc
             .apply_updates_validated(updates, validator)
@@ -795,8 +985,10 @@ where
                 warn!(room=?room.room, %error, "apply_updates failed");
                 error
             })?;
-        if state.doc.should_persist() {
+        let changed = room.crdt != CrdtType::Elo || persisted_before != state.doc.export_snapshot();
+        if state.doc.should_persist() && changed {
             state.dirty = true;
+            state.generation = state.generation.wrapping_add(1);
         }
         Ok(())
     }
@@ -1101,34 +1293,48 @@ where
                 let mut interval = tokio::time::interval(Duration::from_millis(ms));
                 loop {
                     interval.tick().await;
-                    let mut guard = hub_clone.lock().await;
-                    let ws = guard.workspace.clone();
-                    let rooms: Vec<RoomKey> = guard.docs.keys().cloned().collect();
-                    for room in rooms {
-                        if let Some(state) = guard.docs.get_mut(&room) {
-                            if state.dirty && state.doc.should_persist() {
-                                let start = std::time::Instant::now();
-                                if let Some(snapshot) = state.doc.export_snapshot() {
-                                    let room_str = room.room.clone();
-                                    let ctx = state.ctx.clone();
-                                    let args = SaveDocArgs {
-                                        workspace: ws.clone(),
-                                        room: room_str.clone(),
+                    let jobs = {
+                        let guard = hub_clone.lock().await;
+                        let workspace = guard.workspace.clone();
+                        guard
+                            .docs
+                            .iter()
+                            .filter_map(|(room, state)| {
+                                if !state.dirty || !state.doc.should_persist() {
+                                    return None;
+                                }
+                                let data = state.doc.export_snapshot()?;
+                                Some((
+                                    room.clone(),
+                                    state.generation,
+                                    SaveDocArgs {
+                                        workspace: workspace.clone(),
+                                        room: room.room.clone(),
                                         crdt: room.crdt,
-                                        data: snapshot,
-                                        ctx,
-                                    };
-                                    match (saver)(args).await {
-                                        Ok(()) => {
-                                            state.dirty = false;
-                                            let elapsed = start.elapsed();
-                                            debug!(workspace=%ws, room=%room_str, ms=%elapsed.as_millis(), "snapshot saved");
-                                        }
-                                        Err(e) => {
-                                            warn!(workspace=%ws, room=%room_str, %e, "snapshot save failed");
-                                        }
+                                        data,
+                                        ctx: state.ctx.clone(),
+                                    },
+                                ))
+                            })
+                            .collect::<Vec<_>>()
+                    };
+
+                    for (room, generation, args) in jobs {
+                        let started = std::time::Instant::now();
+                        let workspace = args.workspace.clone();
+                        let room_name = args.room.clone();
+                        match (saver)(args).await {
+                            Ok(()) => {
+                                let mut guard = hub_clone.lock().await;
+                                if let Some(state) = guard.docs.get_mut(&room) {
+                                    if state.generation == generation {
+                                        state.dirty = false;
                                     }
                                 }
+                                debug!(workspace=%workspace, room=%room_name, ms=%started.elapsed().as_millis(), "snapshot saved");
+                            }
+                            Err(error) => {
+                                warn!(workspace=%workspace, room=%room_name, %error, "snapshot save failed");
                             }
                         }
                     }
@@ -1208,24 +1414,21 @@ where
         stream,
         move |req: &tungstenite::handshake::server::Request,
               resp: tungstenite::handshake::server::Response| {
-            if let Some(check) = &handshake_auth {
-                // Parse path: expect "/{workspace}" (workspace may be empty)
-                let uri = req.uri();
-                let path = uri.path();
-                let mut workspace_id = "";
-                if let Some(rest) = path.strip_prefix('/') {
-                    if !rest.is_empty() {
-                        // take first segment as workspace id
-                        workspace_id = rest.split('/').next().unwrap_or("");
-                    }
+            // Parse and retain the workspace even when handshake auth is disabled;
+            // persistence hooks must receive the same routing context.
+            let uri = req.uri();
+            let path = uri.path();
+            let mut workspace_id = "";
+            if let Some(rest) = path.strip_prefix('/') {
+                if !rest.is_empty() {
+                    workspace_id = rest.split('/').next().unwrap_or("");
                 }
-                // Save for later
-                {
-                    if let Ok(mut guard) = workspace_holder_c.lock() {
-                        *guard = Some(workspace_id.to_string());
-                    }
-                }
+            }
+            if let Ok(mut guard) = workspace_holder_c.lock() {
+                *guard = Some(workspace_id.to_string());
+            }
 
+            if let Some(check) = &handshake_auth {
                 // Parse query token parameter (no external deps)
                 let token = uri.query().and_then(|q| {
                     for pair in q.split('&') {
@@ -1435,8 +1638,12 @@ where
                             if let Ok(bytes) = loro_protocol::encode(&ok) {
                                 let _ = tx.send(Message::Binary(bytes.into()));
                             }
-                            // Send the initial state, fragmenting it when needed.
-                            if let Some(snapshot) = h.snapshot_bytes(&room) {
+                            // ELO persistence exports are opaque indexes, not generic CRDT
+                            // snapshots; ELO always uses version-filtered backfill below.
+                            let initial_snapshot = (crdt != CrdtType::Elo)
+                                .then(|| h.snapshot_bytes(&room))
+                                .flatten();
+                            if let Some(snapshot) = initial_snapshot {
                                 match send_update(
                                     &tx,
                                     crdt,

@@ -1,7 +1,11 @@
 import type { CrdtServerAdaptor } from "loro-adaptors";
-import { LoroServerAdaptor, LoroEphemeralServerAdaptor, LoroPersistentStoreServerAdaptor } from "loro-adaptors/loro";
+import {
+  LoroServerAdaptor,
+  LoroEphemeralServerAdaptor,
+  LoroPersistentStoreServerAdaptor,
+} from "loro-adaptors/loro";
 import { FlockServerAdaptor } from "loro-adaptors/flock";
-import { CrdtType } from "loro-protocol";
+import type { CrdtType } from "loro-protocol";
 import { EloServerAdaptor } from "./elo-server-adaptor";
 
 export interface ServerAdaptorDescriptor {
@@ -39,7 +43,7 @@ const defaultDescriptors: ServerAdaptorDescriptor[] = [
   },
   {
     adaptor: new EloServerAdaptor(),
-    shouldPersist: false,
+    shouldPersist: true,
     allowBackfillWhenNoOtherClients: true,
   },
 ];

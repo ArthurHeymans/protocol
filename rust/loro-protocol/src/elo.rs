@@ -6,7 +6,7 @@
 //! NOTE: `%ELO` support on the Rust side is work-in-progress; only the container
 //! and header parsing surface is considered stable today.
 
-use crate::bytes::BytesReader;
+use crate::bytes::{BytesReader, BytesWriter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -47,11 +47,32 @@ pub struct ParsedEloRecord<'a> {
     pub ct: &'a [u8],
 }
 
+/// Encode opaque ELO record bytes using the standard container format.
+pub fn encode_elo_container<I, R>(records: I) -> Vec<u8>
+where
+    I: IntoIterator<Item = R>,
+    R: AsRef<[u8]>,
+{
+    let records: Vec<R> = records.into_iter().collect();
+    let mut writer = BytesWriter::new();
+    writer.push_uleb128(records.len() as u64);
+    for record in records {
+        writer.push_var_bytes(record.as_ref());
+    }
+    writer.finalize()
+}
+
 /// Decode an ELO container into a list of record byte slices.
 /// The returned slices borrow from `data`.
-pub fn decode_elo_container<'a>(data: &'a [u8]) -> Result<Vec<&'a [u8]>, String> {
+pub fn decode_elo_container(data: &[u8]) -> Result<Vec<&[u8]>, String> {
     let mut r = BytesReader::new(data);
     let n = usize::try_from(r.read_uleb128()?).map_err(|_| "length too large".to_string())?;
+    // Every record consumes at least one length-prefix byte. Reject impossible
+    // counts before reserving so a tiny corrupt container cannot request a huge
+    // allocation.
+    if n > r.remaining() {
+        return Err("ELO container record count exceeds remaining data".into());
+    }
     let mut out: Vec<&[u8]> = Vec::with_capacity(n);
     for _ in 0..n {
         out.push(r.read_var_bytes()?);
@@ -99,7 +120,7 @@ fn parse_delta<'a>(
     if peer_id.len() > 64 {
         return Err("Invalid ELO delta span: peerId too long".into());
     }
-    if key_id.as_bytes().len() > 64 {
+    if key_id.len() > 64 {
         return Err("Invalid ELO delta span: keyId too long".into());
     }
 
@@ -126,9 +147,15 @@ fn parse_snapshot<'a>(
 ) -> Result<ParsedEloRecord<'a>, String> {
     let count =
         usize::try_from(r.read_uleb128()?).map_err(|_| "vv length too large".to_string())?;
+    if count > 1024 {
+        return Err("Invalid ELO snapshot: vv has more than 1024 entries".into());
+    }
     let mut vv: Vec<(Vec<u8>, u64)> = Vec::with_capacity(count);
     for _ in 0..count {
         let pid = r.read_var_bytes()?.to_vec();
+        if pid.len() > 64 {
+            return Err("Invalid ELO snapshot: peerId too long".into());
+        }
         let ctr = r.read_uleb128()?;
         vv.push((pid, ctr));
     }
@@ -143,12 +170,12 @@ fn parse_snapshot<'a>(
     if iv_bytes.len() != 12 {
         return Err("Invalid ELO snapshot: IV must be 12 bytes".into());
     }
-    if key_id.as_bytes().len() > 64 {
+    if key_id.len() > 64 {
         return Err("Invalid ELO snapshot: keyId too long".into());
     }
-    // vv should be sorted by peer_id bytes ascending
-    if !is_sorted_by_bytes(&vv) {
-        return Err("Invalid ELO snapshot: vv not sorted by peer id bytes".into());
+    // vv must be strictly sorted by peer_id bytes ascending.
+    if !is_strictly_sorted_by_bytes(&vv) {
+        return Err("Invalid ELO snapshot: vv not strictly sorted by peer id bytes".into());
     }
 
     let mut iv = [0u8; 12];
@@ -162,11 +189,11 @@ fn parse_snapshot<'a>(
     })
 }
 
-fn is_sorted_by_bytes(vv: &[(Vec<u8>, u64)]) -> bool {
+fn is_strictly_sorted_by_bytes(vv: &[(Vec<u8>, u64)]) -> bool {
     vv.windows(2).all(|w| {
         let a = &w[0].0;
         let b = &w[1].0;
-        compare_bytes(a, b) <= 0
+        compare_bytes(a, b) < 0
     })
 }
 

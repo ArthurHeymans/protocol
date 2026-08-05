@@ -52,11 +52,7 @@ fn decode_container_and_parse_delta() {
     let ct: Vec<u8> = vec![0xaa, 0xbb, 0xcc, 0xdd];
     let rec = make_delta_record(peer, 5, 8, "k1", &iv, &ct);
 
-    // Pack into container with 1 record
-    let mut w = BytesWriter::new();
-    w.push_uleb128(1);
-    w.push_var_bytes(&rec);
-    let container = w.finalize();
+    let container = encode_elo_container([rec.as_slice()]);
 
     let records = decode_elo_container(&container).expect("container ok");
     assert_eq!(records.len(), 1);
@@ -73,7 +69,7 @@ fn decode_container_and_parse_delta() {
         _ => panic!("expected delta header"),
     }
     assert_eq!(parsed.ct, &ct[..]);
-    assert!(parsed.aad.len() > 0);
+    assert!(!parsed.aad.is_empty());
 }
 
 #[test]
@@ -166,4 +162,9 @@ fn invalid_cases() {
     w.push_byte(0xff); // trailing
     let container = w.finalize();
     assert!(decode_elo_container(&container).is_err());
+
+    // An impossible record count must fail before attempting a huge allocation.
+    let mut w = BytesWriter::new();
+    w.push_uleb128(u64::MAX);
+    assert!(decode_elo_container(&w.finalize()).is_err());
 }

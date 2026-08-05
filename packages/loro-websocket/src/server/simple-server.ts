@@ -1,27 +1,27 @@
 import { WebSocketServer, WebSocket } from "ws";
 import { randomBytes } from "node:crypto";
 import type { RawData } from "ws";
-import type { IncomingMessage } from "http";
+import type { IncomingMessage } from "node:http";
 // no direct CRDT imports here; handled by CrdtDoc implementations
 import {
   encode,
   decode,
   CrdtType,
   MessageType,
-  JoinRequest,
-  JoinResponseOk,
-  JoinError,
+  type JoinRequest,
+  type JoinResponseOk,
+  type JoinError,
   JoinErrorCode,
-  DocUpdate,
-  Ack,
+  type DocUpdate,
+  type Ack,
   UpdateStatusCode,
-  Leave,
-  ProtocolMessage,
-  Permission,
-  RoomId,
-  HexString,
-  DocUpdateFragmentHeader,
-  DocUpdateFragment,
+  type Leave,
+  type ProtocolMessage,
+  type Permission,
+  type RoomId,
+  type HexString,
+  type DocUpdateFragmentHeader,
+  type DocUpdateFragment,
   MAX_MESSAGE_SIZE,
 } from "loro-protocol";
 import {
@@ -52,9 +52,7 @@ export interface SimpleServerConfig {
    * Optional handshake auth: called during WS HTTP upgrade.
    * Return true to accept, false to reject.
    */
-  handshakeAuth?: (
-    req: IncomingMessage
-  ) => boolean | Promise<boolean>;
+  handshakeAuth?: (req: IncomingMessage) => boolean | Promise<boolean>;
 }
 
 interface RoomDocument {
@@ -62,6 +60,7 @@ interface RoomDocument {
   descriptor: ServerAdaptorDescriptor;
   lastSaved: number;
   dirty: boolean;
+  generation: number;
 }
 
 interface ClientConnection {
@@ -83,8 +82,12 @@ interface ClientConnection {
 export class SimpleServer {
   private wss?: WebSocketServer;
   private rooms = new Map<string, RoomDocument>();
+  private roomLoads = new Map<string, Promise<RoomDocument>>();
   private clients = new WeakMap<WebSocket, ClientConnection>();
   private saveTimer?: NodeJS.Timeout;
+  private saveChain: Promise<void> = Promise.resolve();
+  private inFlightMessages = new Set<Promise<void>>();
+  private stopping = false;
   private config: SimpleServerConfig;
   private static readonly DEFAULT_SAVE_INTERVAL = 60000; // 1 minute
 
@@ -93,6 +96,7 @@ export class SimpleServer {
   }
 
   start(): Promise<void> {
+    this.stopping = false;
     return new Promise(resolve => {
       const options: {
         port: number;
@@ -135,6 +139,7 @@ export class SimpleServer {
         this.clients.set(ws, client);
 
         ws.on("message", (data: RawData, isBinary: boolean) => {
+          if (this.stopping) return;
           try {
             const bytes = this.toUint8Array(data);
             // TODO: REVIEW keepalive handling (app-level ping/pong per protocol.md)
@@ -151,7 +156,14 @@ export class SimpleServer {
             }
 
             const message = decode(bytes);
-            void this.handleMessage(client, message);
+            const handling = this.handleMessage(client, message);
+            this.inFlightMessages.add(handling);
+            void handling
+              .catch(error => {
+                console.error("Failed to handle message:", error);
+                ws.close(1002, "Protocol error");
+              })
+              .finally(() => this.inFlightMessages.delete(handling));
           } catch (error) {
             console.error("Failed to decode message:", error);
             ws.close(1002, "Protocol error");
@@ -175,53 +187,55 @@ export class SimpleServer {
     });
   }
 
-  stop(): Promise<void> {
-    return new Promise(resolve => {
-      if (this.saveTimer) {
-        clearInterval(this.saveTimer);
+  async stop(): Promise<void> {
+    this.stopping = true;
+    if (this.saveTimer) {
+      clearInterval(this.saveTimer);
+      this.saveTimer = undefined;
+    }
+
+    const wss = this.wss;
+    if (wss) {
+      await Promise.all(
+        Array.from(wss.clients).map(ws => this.gracefulCloseWebSocket(ws))
+      ).catch(() => {});
+    }
+
+    // Closing clients prevents new work; awaiting accepted handlers prevents an
+    // already-started update or load from racing the final save.
+    await Promise.allSettled(this.inFlightMessages);
+    await this.saveAllDirtyDocuments();
+
+    if (!wss) return;
+    await new Promise<void>(resolve => {
+      try {
+        wss.close(() => resolve());
+      } catch {
+        resolve();
       }
-
-      void this.saveAllDirtyDocuments();
-
-      const wss = this.wss;
-      if (wss) {
-        const clients = Array.from(wss.clients);
-        const closers = Promise.all(
-          clients.map(ws => this.gracefulCloseWebSocket(ws))
-        );
-
-        void closers
-          .catch(() => { })
-          .finally(() => {
-            try {
-              wss.close(() => {
-                resolve();
-              });
-            } catch {
-              resolve();
-            }
-            this.wss = undefined;
-          });
-        return;
-      }
-
-      resolve();
     });
+    this.wss = undefined;
   }
 
   private async gracefulCloseWebSocket(ws: WebSocket): Promise<void> {
     try {
       await this.waitForSocketDrain(ws);
-    } catch { }
+    } catch (error) {
+      void error;
+    }
 
     try {
       ws.close(1001, "Server stopping");
-    } catch { }
+    } catch (error) {
+      void error;
+    }
 
     setTimeout(() => {
       try {
         if (ws.readyState !== WebSocket.CLOSED) ws.terminate();
-      } catch { }
+      } catch (error) {
+        void error;
+      }
     }, 50);
   }
 
@@ -243,7 +257,11 @@ export class SimpleServer {
         }
 
         const buffered = readBufferedAmount();
-        if (buffered == null || buffered <= 0 || Date.now() - start >= timeoutMs) {
+        if (
+          buffered == null ||
+          buffered <= 0 ||
+          Date.now() - start >= timeoutMs
+        ) {
           resolve();
           return;
         }
@@ -341,13 +359,14 @@ export class SimpleServer {
         message.crdt
       );
       const roomKey = this.getRoomKey(message.roomId, message.crdt);
-      client.rooms.add(roomKey);
-      client.permissions.set(roomKey, permission);
-
       const joinResult = roomDoc.descriptor.adaptor.handleJoinRequest(
         roomDoc.data,
-        message.version,
+        message.version
       );
+
+      // Register membership only after loading and join preparation succeed.
+      client.rooms.add(roomKey);
+      client.permissions.set(roomKey, permission);
 
       // Send join response with current document version
       const response: JoinResponseOk = {
@@ -368,19 +387,19 @@ export class SimpleServer {
         client
       );
       const shouldBackfill =
-        (hasOthers ||
-          roomDoc.descriptor.allowBackfillWhenNoOtherClients) &&
+        (hasOthers || roomDoc.descriptor.allowBackfillWhenNoOtherClients) &&
         joinResult.updates &&
         joinResult.updates.length;
 
       if (shouldBackfill && joinResult.updates) {
-        this.sendMessage(client.ws, {
-          type: MessageType.DocUpdate,
-          crdt: message.crdt,
-          roomId: message.roomId,
-          updates: joinResult.updates,
-          batchId: this.newBatchId(),
-        });
+        for (const update of joinResult.updates) {
+          this.sendUpdateOrFragments(
+            client.ws,
+            message.crdt,
+            message.roomId,
+            update
+          );
+        }
       }
     } catch (error) {
       this.sendJoinError(
@@ -399,14 +418,16 @@ export class SimpleServer {
     try {
       // Guard: reject payloads that exceed max update size
       // (Clients fragment large updates; this is a safety net.)
-      const oversized = message.updates.some(u => u.length > MAX_MESSAGE_SIZE);
+      const oversized = message.updates.some(
+        (update: Uint8Array) => update.length > MAX_MESSAGE_SIZE
+      );
       if (oversized) {
         this.sendAck(
           client.ws,
           message.batchId,
           UpdateStatusCode.PayloadTooLarge,
           message.crdt,
-          message.roomId,
+          message.roomId
         );
         return;
       }
@@ -420,7 +441,7 @@ export class SimpleServer {
           message.batchId,
           UpdateStatusCode.PermissionDenied,
           message.crdt,
-          message.roomId,
+          message.roomId
         );
         client.fragments.delete(message.batchId);
         return;
@@ -435,7 +456,7 @@ export class SimpleServer {
           message.batchId,
           UpdateStatusCode.PermissionDenied,
           message.crdt,
-          message.roomId,
+          message.roomId
         );
         return;
       }
@@ -448,7 +469,7 @@ export class SimpleServer {
       try {
         const newDocumentData = roomDoc.descriptor.adaptor.applyUpdates(
           roomDoc.data,
-          message.updates,
+          message.updates
         );
         roomDoc.data = newDocumentData;
       } catch (error) {
@@ -458,14 +479,14 @@ export class SimpleServer {
           message.batchId,
           UpdateStatusCode.InvalidUpdate,
           message.crdt,
-          message.roomId,
+          message.roomId
         );
         return;
       }
 
-
       if (roomDoc.descriptor.shouldPersist) {
         roomDoc.dirty = true;
+        roomDoc.generation++;
       }
 
       const updatesForBroadcast = message.updates;
@@ -475,7 +496,7 @@ export class SimpleServer {
         message.batchId,
         UpdateStatusCode.Ok,
         message.crdt,
-        message.roomId,
+        message.roomId
       );
 
       if (updatesForBroadcast.length > 0) {
@@ -486,12 +507,7 @@ export class SimpleServer {
           updates: updatesForBroadcast,
           batchId: message.batchId,
         };
-        this.broadcastToRoom(
-          message.roomId,
-          message.crdt,
-          outgoing,
-          client
-        );
+        this.broadcastToRoom(message.roomId, message.crdt, outgoing, client);
       }
     } catch (error) {
       console.error(error);
@@ -500,7 +516,7 @@ export class SimpleServer {
         message.batchId,
         UpdateStatusCode.Unknown,
         message.crdt,
-        message.roomId,
+        message.roomId
       );
     }
   }
@@ -518,13 +534,16 @@ export class SimpleServer {
         message.batchId,
         UpdateStatusCode.PermissionDenied,
         message.crdt,
-        message.roomId,
+        message.roomId
       );
       return;
     }
 
     const batch = {
-      data: Array.from({ length: message.fragmentCount }, () => new Uint8Array()),
+      data: Array.from(
+        { length: message.fragmentCount },
+        () => new Uint8Array()
+      ),
       totalSize: message.totalSizeBytes,
       received: 0,
       header: message,
@@ -538,7 +557,7 @@ export class SimpleServer {
         message.batchId,
         UpdateStatusCode.FragmentTimeout,
         message.crdt,
-        message.roomId,
+        message.roomId
       );
     }, 10000);
 
@@ -556,7 +575,7 @@ export class SimpleServer {
         message.batchId,
         UpdateStatusCode.FragmentTimeout,
         message.crdt,
-        message.roomId,
+        message.roomId
       );
       return;
     }
@@ -586,7 +605,7 @@ export class SimpleServer {
           message.batchId,
           UpdateStatusCode.PermissionDenied,
           message.crdt,
-          message.roomId,
+          message.roomId
         );
         return;
       }
@@ -598,7 +617,7 @@ export class SimpleServer {
           message.batchId,
           UpdateStatusCode.PermissionDenied,
           message.crdt,
-          message.roomId,
+          message.roomId
         );
         client.fragments.delete(message.batchId);
         return;
@@ -612,7 +631,7 @@ export class SimpleServer {
       try {
         const newDocumentData = roomDoc.descriptor.adaptor.applyUpdates(
           roomDoc.data,
-          [totalData],
+          [totalData]
         );
         roomDoc.data = newDocumentData;
       } catch (error) {
@@ -622,13 +641,14 @@ export class SimpleServer {
           message.batchId,
           UpdateStatusCode.InvalidUpdate,
           message.crdt,
-          message.roomId,
+          message.roomId
         );
         client.fragments.delete(message.batchId);
         return;
       }
       if (roomDoc.descriptor.shouldPersist) {
         roomDoc.dirty = true;
+        roomDoc.generation++;
       }
 
       // Notify sender
@@ -637,7 +657,7 @@ export class SimpleServer {
         message.batchId,
         UpdateStatusCode.Ok,
         message.crdt,
-        message.roomId,
+        message.roomId
       );
 
       // Broadcast original fragments to other clients in the room
@@ -685,37 +705,45 @@ export class SimpleServer {
   ): Promise<RoomDocument> {
     const roomKey = this.getRoomKey(roomId, crdtType);
 
-    let roomDoc = this.rooms.get(roomKey);
+    const roomDoc = this.rooms.get(roomKey);
     if (roomDoc) return roomDoc;
 
-    const descriptor = getServerAdaptorDescriptor(crdtType);
-    if (!descriptor) throw new Error("Unsupported CRDT type");
+    const existingLoad = this.roomLoads.get(roomKey);
+    if (existingLoad) return existingLoad;
 
-    let data = descriptor.adaptor.createEmpty();
+    const loading = (async (): Promise<RoomDocument> => {
+      const descriptor = getServerAdaptorDescriptor(crdtType);
+      if (!descriptor) throw new Error("Unsupported CRDT type");
 
-    if (descriptor.shouldPersist && this.config.onLoadDocument) {
-      try {
-        const loaded = await this.config.onLoadDocument(
-          roomId,
-          crdtType
-        );
-        if (loaded) {
-          data = loaded;
+      let data = descriptor.adaptor.createEmpty();
+      if (descriptor.shouldPersist && this.config.onLoadDocument) {
+        try {
+          const loaded = await this.config.onLoadDocument(roomId, crdtType);
+          if (loaded) data = loaded;
+        } catch (error) {
+          console.warn("Failed to load document:", error);
+          throw error;
         }
-      } catch (error) {
-        console.warn("Failed to load document:", error);
-        throw error;
+      }
+
+      const loadedRoom: RoomDocument = {
+        data,
+        descriptor,
+        lastSaved: Date.now(),
+        dirty: false,
+        generation: 0,
+      };
+      this.rooms.set(roomKey, loadedRoom);
+      return loadedRoom;
+    })();
+    this.roomLoads.set(roomKey, loading);
+    try {
+      return await loading;
+    } finally {
+      if (this.roomLoads.get(roomKey) === loading) {
+        this.roomLoads.delete(roomKey);
       }
     }
-
-    roomDoc = {
-      data,
-      descriptor,
-      lastSaved: Date.now(),
-      dirty: false,
-    };
-    this.rooms.set(roomKey, roomDoc);
-    return roomDoc;
   }
 
   private sendJoinError(
@@ -738,6 +766,53 @@ export class SimpleServer {
     if (ws.readyState === WebSocket.OPEN) {
       const data = encode(message);
       ws.send(data);
+    }
+  }
+
+  private sendUpdateOrFragments(
+    ws: WebSocket,
+    crdt: CrdtType,
+    roomId: RoomId,
+    update: Uint8Array
+  ): void {
+    const fragmentSize = Math.max(
+      1,
+      Math.min(240 * 1024, MAX_MESSAGE_SIZE - 4096)
+    );
+    const batchId = this.newBatchId();
+    if (update.length <= fragmentSize) {
+      this.sendMessage(ws, {
+        type: MessageType.DocUpdate,
+        crdt,
+        roomId,
+        updates: [update],
+        batchId,
+      });
+      return;
+    }
+
+    const fragmentCount = Math.ceil(update.length / fragmentSize);
+    this.sendMessage(ws, {
+      type: MessageType.DocUpdateFragmentHeader,
+      crdt,
+      roomId,
+      batchId,
+      fragmentCount,
+      totalSizeBytes: update.length,
+    });
+    for (let index = 0; index < fragmentCount; index++) {
+      const start = index * fragmentSize;
+      this.sendMessage(ws, {
+        type: MessageType.DocUpdateFragment,
+        crdt,
+        roomId,
+        batchId,
+        index,
+        fragment: update.subarray(
+          start,
+          Math.min(start + fragmentSize, update.length)
+        ),
+      });
     }
   }
 
@@ -799,27 +874,40 @@ export class SimpleServer {
     return `${roomId}:${crdtType}`;
   }
 
-  private parseRoomKey(
-    roomKey: string
-  ): { roomId: string; crdtType: CrdtType } {
+  private parseRoomKey(roomKey: string): {
+    roomId: string;
+    crdtType: CrdtType;
+  } {
     const sep = roomKey.lastIndexOf(":");
     if (sep === -1) {
       return { roomId: roomKey, crdtType: CrdtType.Loro };
     }
     const roomId = roomKey.slice(0, sep);
-    const crdtType = Number(roomKey.slice(sep + 1)) as unknown as CrdtType;
+    const crdtType = roomKey.slice(sep + 1) as CrdtType;
     return { roomId, crdtType };
   }
 
-  private async saveAllDirtyDocuments(): Promise<void> {
+  private saveAllDirtyDocuments(): Promise<void> {
+    const queuedSave = this.saveChain.then(() =>
+      this.saveAllDirtyDocumentsOnce()
+    );
+    this.saveChain = queuedSave.catch(() => {});
+    return queuedSave;
+  }
+
+  private async saveAllDirtyDocumentsOnce(): Promise<void> {
     if (!this.config.onSaveDocument) return;
 
     for (const [roomKey, roomDoc] of this.rooms) {
       if (!roomDoc.dirty || !roomDoc.descriptor.shouldPersist) continue;
+      const generation = roomDoc.generation;
+      const data = roomDoc.data;
       try {
         const { roomId, crdtType } = this.parseRoomKey(roomKey);
-        await this.config.onSaveDocument(roomId, crdtType, roomDoc.data);
-        roomDoc.dirty = false;
+        await this.config.onSaveDocument(roomId, crdtType, data);
+        if (roomDoc.generation === generation) {
+          roomDoc.dirty = false;
+        }
         roomDoc.lastSaved = Date.now();
       } catch (error) {
         console.error("Failed to save document:", error);

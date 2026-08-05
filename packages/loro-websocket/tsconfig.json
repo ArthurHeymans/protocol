@@ -11,6 +11,8 @@
     "src",
     "tests/permission.test.ts",
     "tests/e2e-elo.test.ts",
+    "tests/e2e-elo-persistence.test.ts",
+    "tests/elo-doc.test.ts",
     "tests/e2e.test.ts"
   ]
 }

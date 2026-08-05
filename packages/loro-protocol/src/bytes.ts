@@ -7,7 +7,7 @@ export class BytesWriter {
       return;
     }
 
-    let nextLen = nextPow2u32(size + this.len);
+    const nextLen = nextPow2u32(size + this.len);
     const buf = this.buf;
     this.buf = new Uint8Array(nextLen);
     this.buf.set(buf, 0);
@@ -30,9 +30,13 @@ export class BytesWriter {
   }
 
   pushUleb128(n: number) {
+    if (!Number.isSafeInteger(n) || n < 0) {
+      throw new Error("uleb128 value must be a non-negative safe integer");
+    }
     do {
-      this.pushByte((n & 0x7f) | (n >= 128 ? 0x80 : 0));
-      n >>>= 7;
+      const byte = n % 128;
+      n = Math.floor(n / 128);
+      this.pushByte(byte | (n > 0 ? 0x80 : 0));
     } while (n > 0);
   }
 
@@ -92,21 +96,19 @@ export class BytesReader {
 
   readUleb128(): number {
     let result = 0;
-    let shift = 0;
-    // Up to 5 bytes is enough for 32-bit lengths; protocol sizes are small.
+    let multiplier = 1;
     while (true) {
       const byte = this.readByte();
-      result |= (byte & 0x7f) << shift;
-      if ((byte & 0x80) === 0) {
-        break;
+      result += (byte & 0x7f) * multiplier;
+      if (!Number.isSafeInteger(result)) {
+        throw new Error("uleb128 exceeds JavaScript safe integer range");
       }
-      shift += 7;
-      if (shift > 35) {
-        // Prevent pathological inputs from shifting indefinitely.
-        throw new Error("uleb128 too large");
+      if ((byte & 0x80) === 0) return result;
+      multiplier *= 128;
+      if (!Number.isSafeInteger(multiplier)) {
+        throw new Error("uleb128 exceeds JavaScript safe integer range");
       }
     }
-    return result >>> 0;
   }
 
   readVarBytes(): Uint8Array {

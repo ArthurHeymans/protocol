@@ -3,12 +3,14 @@
 Minimal async WebSocket server for the Loro protocol. Broadcasts DocUpdates between clients and provides hooks for auth and persistence. It mirrors the TypeScript server in `packages/loro-websocket`.
 
 ## Features
+
 - Supports `%LOR`, `%EPH`, `%ELO` (experimental/WIP) and related CRDT types with fragment reassembly (≤256 KiB per message).
 - Connection keepalive handling (`"ping"/"pong"` text frames).
 - Workspace isolation via URL path (`/{workspace}`) and optional handshake auth.
 - Load/save hooks with optional per-document metadata context to assist persistence.
+- `%ELO` persistence stores the standard opaque ELO container (latest validated snapshot plus indexed deltas); the server never decrypts records.
 
-> %ELO is treated as an opaque encrypted payload on the server; the Rust client adaptor is snapshot-only today and considered WIP.
+Rust persistence is periodic. Durability is therefore bounded by `save_interval_ms`; stopping an externally spawned server task does not provide an additional flush hook.
 
 ## Quick start
 

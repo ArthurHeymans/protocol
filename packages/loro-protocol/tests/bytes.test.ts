@@ -4,8 +4,23 @@ import { BytesReader, BytesWriter } from "../src/bytes";
 describe("BytesWriter/BytesReader", () => {
   it("round-trips ULEB128 for typical bounds", () => {
     const values = [
-      0, 1, 2, 10, 127, 128, 129, 255, 256, 16383, 16384, 0xffff, 0x1fffff,
-      0x0fffffff, 0x7fffffff,
+      0,
+      1,
+      2,
+      10,
+      127,
+      128,
+      129,
+      255,
+      256,
+      16383,
+      16384,
+      0xffff,
+      0x1fffff,
+      0x0fffffff,
+      0x7fffffff,
+      0xffff_ffff,
+      Number.MAX_SAFE_INTEGER,
     ];
 
     const w = new BytesWriter();
@@ -21,6 +36,21 @@ describe("BytesWriter/BytesReader", () => {
     }
     expect(out).toEqual(values);
     expect(r.remaining).toBe(0);
+  });
+
+  it("rejects invalid or unrepresentable ULEB128 values", () => {
+    const writer = new BytesWriter();
+    expect(() => writer.pushUleb128(-1)).toThrow(/non-negative safe integer/);
+    expect(() => writer.pushUleb128(Number.MAX_SAFE_INTEGER + 1)).toThrow(
+      /non-negative safe integer/
+    );
+
+    const overflowingU64 = new Uint8Array([
+      0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01,
+    ]);
+    expect(() => new BytesReader(overflowingU64).readUleb128()).toThrow(
+      /safe integer range/
+    );
   });
 
   it("round-trips varBytes with empty, small, and large payloads", () => {
