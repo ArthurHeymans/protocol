@@ -1011,6 +1011,7 @@ dependencies = [
  "aes-gcm",
  "async-trait",
  "futures-util",
+ "getrandom 0.3.3",
  "loro",
  "loro-protocol",
  "tokio",

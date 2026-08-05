@@ -296,6 +296,19 @@ mod tests {
         assert_eq!(updates.as_slice(), &[b"helloworld".to_vec()]);
     }
 
+    fn require_ok<T, E: std::fmt::Debug>(result: Result<T, E>, context: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("{context}: {error:?}"),
+        }
+    }
+
+    fn lock_unpoisoned<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn elo_snapshot_container_roundtrips_plaintext() {
         let doc = Arc::new(Mutex::new(LoroDoc::new()));
@@ -304,26 +317,34 @@ mod tests {
             .with_iv_factory(Arc::new(|| [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]));
         let plaintext = b"hello-elo".to_vec();
 
-        let container = adaptor.encode_elo_snapshot_container(&plaintext);
-        let records =
-            protocol::elo::decode_elo_container(&container).expect("container should decode");
+        let container = require_ok(
+            adaptor.encode_elo_snapshot_container(&plaintext),
+            "deterministic IV generation should succeed",
+        );
+        let records = require_ok(
+            protocol::elo::decode_elo_container(&container),
+            "container should decode",
+        );
         assert_eq!(records.len(), 1);
-        let parsed =
-            protocol::elo::parse_elo_record_header(records[0]).expect("header should parse");
+        let parsed = require_ok(
+            protocol::elo::parse_elo_record_header(records[0]),
+            "header should parse",
+        );
         match parsed.header {
             protocol::elo::EloHeader::Snapshot(hdr) => {
                 assert_eq!(hdr.key_id, "kid");
                 assert_eq!(hdr.iv, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
-                let cipher = aes_gcm::Aes256Gcm::new_from_slice(&key).unwrap();
-                let decrypted = cipher
-                    .decrypt(
+                let cipher = aes_gcm::Aes256Gcm::new((&key).into());
+                let decrypted = require_ok(
+                    cipher.decrypt(
                         aes_gcm::Nonce::from_slice(&hdr.iv),
                         aes_gcm::aead::Payload {
                             msg: parsed.ct,
                             aad: parsed.aad,
                         },
-                    )
-                    .unwrap();
+                    ),
+                    "ciphertext should decrypt",
+                );
                 assert_eq!(decrypted, plaintext);
             }
             _ => panic!("expected snapshot header"),
@@ -332,6 +353,100 @@ mod tests {
             parsed.kind,
             protocol::elo::EloRecordKind::Snapshot
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn elo_default_iv_generation_is_random() {
+        let doc = Arc::new(Mutex::new(LoroDoc::new()));
+        let adaptor = EloDocAdaptor::new(doc, "kid", [7u8; 32]);
+
+        let first = require_ok(
+            adaptor.encode_elo_snapshot_container(b"first"),
+            "OS randomness should be available",
+        );
+        let second = require_ok(
+            adaptor.encode_elo_snapshot_container(b"second"),
+            "OS randomness should be available",
+        );
+
+        let first_records = require_ok(
+            protocol::elo::decode_elo_container(&first),
+            "first container should decode",
+        );
+        let second_records = require_ok(
+            protocol::elo::decode_elo_container(&second),
+            "second container should decode",
+        );
+        let first_header = require_ok(
+            protocol::elo::parse_elo_record_header(first_records[0]),
+            "first header should parse",
+        );
+        let second_header = require_ok(
+            protocol::elo::parse_elo_record_header(second_records[0]),
+            "second header should parse",
+        );
+        let first_iv = match first_header.header {
+            protocol::elo::EloHeader::Snapshot(header) => header.iv,
+            _ => panic!("expected snapshot header"),
+        };
+        let second_iv = match second_header.header {
+            protocol::elo::EloHeader::Snapshot(header) => header.iv,
+            _ => panic!("expected snapshot header"),
+        };
+
+        assert_ne!(first_iv, [0; 12]);
+        assert_ne!(second_iv, [0; 12]);
+        assert_ne!(first_iv, second_iv);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn elo_randomness_failure_is_reported_without_sending() {
+        let doc = Arc::new(Mutex::new(LoroDoc::new()));
+        let mut adaptor = EloDocAdaptor::new(doc.clone(), "kid", [7u8; 32])
+            .with_iv_generator(Arc::new(|| Err(getrandom::Error::UNSUPPORTED)));
+
+        let error = match adaptor.encode_elo_snapshot_container(b"plaintext") {
+            Ok(_) => panic!("randomness failure must abort encryption"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            EloCryptoError::Randomness(error) if error == getrandom::Error::UNSUPPORTED
+        ));
+
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let reported = Arc::new(StdMutex::new(Vec::new()));
+        adaptor
+            .set_ctx(CrdtAdaptorContext {
+                send_update: {
+                    let sent = sent.clone();
+                    Arc::new(move |update| lock_unpoisoned(&sent).push(update))
+                },
+                on_join_failed: Arc::new(|_| {}),
+                on_import_error: {
+                    let reported = reported.clone();
+                    Arc::new(move |error, _| lock_unpoisoned(&reported).push(error))
+                },
+            })
+            .await;
+        {
+            let doc = doc.lock().await;
+            require_ok(
+                doc.get_text("text").insert(0, "local update"),
+                "local edit should succeed",
+            );
+            doc.commit();
+        }
+        adaptor
+            .handle_join_ok(protocol::Permission::Write, Vec::new())
+            .await;
+
+        assert!(lock_unpoisoned(&sent).is_empty());
+        let reported = lock_unpoisoned(&reported);
+        assert_eq!(reported.len(), 2);
+        assert!(reported
+            .iter()
+            .all(|error| error.contains("secure random IV generation failed")));
     }
 }
 
@@ -1247,6 +1362,84 @@ impl Drop for LoroDocAdaptor {
 }
 
 // --- EloDocAdaptor: E2EE Loro (minimal snapshot-only packaging) ---
+const ELO_IV_LENGTH: usize = 12;
+
+type EloIvGenerator =
+    Arc<dyn Fn() -> Result<[u8; ELO_IV_LENGTH], getrandom::Error> + Send + Sync>;
+
+/// A local failure that prevents an encrypted ELO record from being emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EloCryptoError {
+    /// The operating system could not provide a fresh IV.
+    Randomness(getrandom::Error),
+    /// AES-GCM could not encrypt the plaintext.
+    Encryption,
+}
+
+impl std::fmt::Display for EloCryptoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EloCryptoError::Randomness(error) => {
+                write!(f, "secure random IV generation failed: {error}")
+            }
+            EloCryptoError::Encryption => write!(f, "AES-GCM encryption failed"),
+        }
+    }
+}
+
+impl std::error::Error for EloCryptoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            EloCryptoError::Randomness(error) => Some(error),
+            EloCryptoError::Encryption => None,
+        }
+    }
+}
+
+fn secure_random_iv() -> Result<[u8; ELO_IV_LENGTH], getrandom::Error> {
+    let mut iv = [0; ELO_IV_LENGTH];
+    getrandom::fill(&mut iv)?;
+    Ok(iv)
+}
+
+fn encode_elo_snapshot_container_with(
+    key_id: &str,
+    key: &[u8; 32],
+    iv_generator: &EloIvGenerator,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, EloCryptoError> {
+    use protocol::bytes::BytesWriter;
+
+    let iv = iv_generator().map_err(EloCryptoError::Randomness)?;
+    let mut hdr = BytesWriter::new();
+    hdr.push_byte(protocol::elo::EloRecordKind::Snapshot as u8);
+    hdr.push_uleb128(0); // vv count = 0
+    hdr.push_var_string(key_id);
+    hdr.push_var_bytes(&iv);
+    let header_bytes = hdr.finalize();
+
+    let cipher = aes_gcm::Aes256Gcm::new(key.into());
+    let ct = cipher
+        .encrypt(
+            aes_gcm::Nonce::from_slice(&iv),
+            aes_gcm::aead::Payload {
+                msg: plaintext,
+                aad: &header_bytes,
+            },
+        )
+        .map_err(|_| EloCryptoError::Encryption)?;
+
+    let mut rec = BytesWriter::new();
+    rec.push_bytes(&header_bytes);
+    rec.push_var_bytes(&ct);
+    let record = rec.finalize();
+
+    let mut cont = BytesWriter::new();
+    cont.push_uleb128(1);
+    cont.push_var_bytes(&record);
+    Ok(cont.finalize())
+}
+
 /// Experimental %ELO adaptor. Snapshot-only packaging is implemented today;
 /// delta packaging and API stability are WIP and may change.
 pub struct EloDocAdaptor {
@@ -1254,7 +1447,7 @@ pub struct EloDocAdaptor {
     ctx: Option<CrdtAdaptorContext>,
     key_id: String,
     key: [u8; 32],
-    iv_factory: Option<Arc<dyn Fn() -> [u8; 12] + Send + Sync>>,
+    iv_generator: EloIvGenerator,
     sub: Option<loro::Subscription>,
 }
 
@@ -1265,51 +1458,25 @@ impl EloDocAdaptor {
             ctx: None,
             key_id: key_id.into(),
             key,
-            iv_factory: None,
+            iv_generator: Arc::new(secure_random_iv),
             sub: None,
         }
     }
 
+    /// Overrides secure IV generation with a deterministic compatibility helper.
     pub fn with_iv_factory(mut self, f: Arc<dyn Fn() -> [u8; 12] + Send + Sync>) -> Self {
-        self.iv_factory = Some(f);
+        self.iv_generator = Arc::new(move || Ok(f()));
         self
     }
 
-    fn encode_elo_snapshot_container(&self, plaintext: &[u8]) -> Vec<u8> {
-        use protocol::bytes::BytesWriter;
-        // Build ELO Snapshot header with empty vv and IV
-        let iv: [u8; 12] = self.iv_factory.as_ref().map(|f| (f)()).unwrap_or([0u8; 12]);
-        let mut hdr = BytesWriter::new();
-        hdr.push_byte(protocol::elo::EloRecordKind::Snapshot as u8);
-        hdr.push_uleb128(0); // vv count = 0
-        hdr.push_var_string(&self.key_id);
-        hdr.push_var_bytes(&iv);
-        let header_bytes = hdr.finalize();
+    #[cfg(test)]
+    fn with_iv_generator(mut self, generator: EloIvGenerator) -> Self {
+        self.iv_generator = generator;
+        self
+    }
 
-        // Encrypt using AES-256-GCM with AAD=header_bytes and IV
-        let cipher = aes_gcm::Aes256Gcm::new_from_slice(&self.key).expect("key");
-        let nonce = aes_gcm::Nonce::from_slice(&iv);
-        let ct = cipher
-            .encrypt(
-                nonce,
-                aes_gcm::aead::Payload {
-                    msg: plaintext,
-                    aad: &header_bytes,
-                },
-            )
-            .expect("encrypt elo snapshot");
-
-        // Append ct as varBytes after header
-        let mut rec = BytesWriter::new();
-        rec.push_bytes(&header_bytes);
-        rec.push_var_bytes(&ct);
-        let record = rec.finalize();
-
-        // Container (1 record)
-        let mut cont = BytesWriter::new();
-        cont.push_uleb128(1);
-        cont.push_var_bytes(&record);
-        cont.finalize()
+    fn encode_elo_snapshot_container(&self, plaintext: &[u8]) -> Result<Vec<u8>, EloCryptoError> {
+        encode_elo_snapshot_container_with(&self.key_id, &self.key, &self.iv_generator, plaintext)
     }
 }
 
@@ -1335,40 +1502,16 @@ impl CrdtDocAdaptor for EloDocAdaptor {
         let send = ctx.send_update.clone();
         let key_id = self.key_id.clone();
         let key = self.key;
-        let iv_factory = self.iv_factory.clone();
+        let iv_generator = self.iv_generator.clone();
+        let on_error = ctx.on_import_error.clone();
         // Subscribe to local updates and send encrypted containers for each emitted local blob.
         // Note: minimal snapshot-record packaging with empty VV.
         let sub = {
             let guard = doc.lock().await;
             guard.subscribe_local_update(Box::new(move |bytes| {
-                use protocol::bytes::BytesWriter;
-                let iv: [u8; 12] = iv_factory.as_ref().map(|f| (f)()).unwrap_or([0u8; 12]);
-                let mut hdr = BytesWriter::new();
-                hdr.push_byte(protocol::elo::EloRecordKind::Snapshot as u8);
-                hdr.push_uleb128(0); // vv count = 0
-                hdr.push_var_string(&key_id);
-                hdr.push_var_bytes(&iv);
-                let header_bytes = hdr.finalize();
-
-                // Encrypt
-                let cipher = aes_gcm::Aes256Gcm::new_from_slice(&key).expect("key");
-                let nonce = aes_gcm::Nonce::from_slice(&iv);
-                if let Ok(ct) = cipher.encrypt(
-                    nonce,
-                    aes_gcm::aead::Payload {
-                        msg: &bytes,
-                        aad: &header_bytes,
-                    },
-                ) {
-                    let mut rec = BytesWriter::new();
-                    rec.push_bytes(&header_bytes);
-                    rec.push_var_bytes(&ct);
-                    let record = rec.finalize();
-                    let mut cont = BytesWriter::new();
-                    cont.push_uleb128(1);
-                    cont.push_var_bytes(&record);
-                    let container = cont.finalize();
-                    (send)(container);
+                match encode_elo_snapshot_container_with(&key_id, &key, &iv_generator, bytes) {
+                    Ok(container) => (send)(container),
+                    Err(error) => (on_error)(error.to_string(), Vec::new()),
                 }
                 true
             }))
@@ -1382,9 +1525,12 @@ impl CrdtDocAdaptor for EloDocAdaptor {
         // This minimal implementation uses snapshot-only packaging and empty VV.
         // It is correct but not optimal; consider delta packaging in a follow-up.
         if let Ok(snap) = self.doc.lock().await.export(loro::ExportMode::Snapshot) {
-            let ct = self.encode_elo_snapshot_container(&snap);
+            let encrypted = self.encode_elo_snapshot_container(&snap);
             if let Some(ctx) = &self.ctx {
-                (ctx.send_update)(ct);
+                match encrypted {
+                    Ok(container) => (ctx.send_update)(container),
+                    Err(error) => (ctx.on_import_error)(error.to_string(), Vec::new()),
+                }
             }
         }
         // Subscription is established in set_ctx() to match TS behavior.
@@ -1400,7 +1546,7 @@ impl CrdtDocAdaptor for EloDocAdaptor {
                             protocol::elo::EloHeader::Snapshot(h) => h.iv,
                         };
                         let aad = parsed.aad;
-                        let cipher = aes_gcm::Aes256Gcm::new_from_slice(&self.key).expect("key");
+                        let cipher = aes_gcm::Aes256Gcm::new((&self.key).into());
                         if let Ok(pt) = cipher.decrypt(
                             aes_gcm::Nonce::from_slice(&iv),
                             aes_gcm::aead::Payload {
